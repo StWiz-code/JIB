@@ -1,0 +1,33 @@
+# 환경변수 (절대 올리면 안 됨)
+.env
+
+# 가상환경
+venv/
+.venv/
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 원본 데이터 (용량 크고 재배포 불필요)
+data/raw/
+data/eis/
+
+# IDE
+.vscode/
+.idea/
+*.cursor
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 로그
+*.log
+
+# 아래는 GitHub에 포함 (배포에 필요)
+# embeddings/job_embeddings.csv → 포함
+# data/processed/master_job_data.csv → 포함
+# data/processed/ncs_corpus.csv → 포함

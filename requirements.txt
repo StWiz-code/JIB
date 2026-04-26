@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+openai
+anthropic
+python-dotenv
+scikit-learn
+plotly
+requests
+openpyxl
+xlrd
+chardet
