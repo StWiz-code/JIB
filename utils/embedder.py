@@ -10,6 +10,7 @@ JIB(Job_Insight_Bridge) — 임베딩 모듈 (파일 기반 v2).
 
 기능 구성:
     1) build_corpus_from_files() — master + ncs 파일 병합 → embed_text 코퍼스 생성
+       (클라우드 환경에서는 워크넷 OpenAPI 키워드 검색으로 5개 도메인을 추가 보강)
     2) generate_embeddings()      — embed_text → OpenAI text-embedding-3-small
     3) load_embeddings()          — 저장된 임베딩을 numpy 벡터로 복원해 로드
 """
@@ -48,6 +49,15 @@ BATCH_SLEEP_SEC: float = 0.5
 MIN_EMBED_TEXT_LEN: int = 10
 # 임베딩 캐시 파일 무효화 임계 (이 크기 이하면 빈 파일로 간주하고 자동 삭제).
 EMPTY_FILE_THRESHOLD_BYTES: int = 100
+
+# Streamlit Cloud / 컨테이너 환경 감지.
+#   - STREAMLIT_CLOUD=1 환경변수: Streamlit Cloud / 사용자 정의 배포에서 직접 표기.
+#   - /app 경로 존재: Streamlit Cloud / Heroku 등 컨테이너 빌드의 기본 작업 디렉터리.
+# 클라우드일 때만 워크넷 OpenAPI 실시간 호출을 시도하고, 로컬에서는 파일 기반 폴백을 쓴다.
+IS_CLOUD: bool = (
+    os.environ.get("STREAMLIT_CLOUD", "") == "1"
+    or os.path.exists("/app")
+)
 
 
 def _resolve_path(p: Union[str, os.PathLike]) -> Path:
@@ -133,6 +143,147 @@ def _is_meaningful(value) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 워크넷 NCS OpenAPI 헬퍼 (클라우드 환경 전용 — 로컬에서는 호출되지 않는다)
+# ──────────────────────────────────────────────────────────────────────────────
+# 표준 NCS 응답 키 후보 (work24 직무사전 응답이 카멜/스네이크/한글 혼용이므로 매핑 테이블화).
+_WORKNET_KEY_MAP = {
+    "대분류명":     ("ncsLclasNm", "lcNcsClcdNm", "lcNm", "대분류명", "lclasNm"),
+    "중분류명":     ("ncsMclasNm", "mcNcsClcdNm", "mcNm", "중분류명", "mclasNm"),
+    "소분류명":     ("ncsSclasNm", "scNcsClcdNm", "scNm", "소분류명", "sclasNm"),
+    "직무명":       ("jobNm", "ncsJobNm", "dutyNm", "직무명"),
+    "전직가능직무명": ("convtJobNm", "relJobNm", "trnsJobNm", "전직가능직무명"),
+}
+
+
+def _normalize_worknet_item(item: dict) -> dict:
+    """워크넷 응답 1건을 표준 NCS 스키마(대/중/소분류명, 직무명, 전직가능직무명)로 매핑한다."""
+    out: dict = {}
+    for std, candidates in _WORKNET_KEY_MAP.items():
+        value = ""
+        for k in candidates:
+            v = item.get(k)
+            if v not in (None, "", "null"):
+                value = str(v).strip()
+                break
+        out[std] = value
+    return out
+
+
+def _parse_worknet_response(text: str) -> List[dict]:
+    """
+    워크넷 직무사전 응답 본문을 파싱해 표준 dict 리스트로 변환한다.
+
+    - JSON / XML 어느 쪽이든 동일 스키마로 정규화한다.
+    - 직무명이 비어 있는 항목은 제거한다.
+    - 파싱 실패 시 빈 리스트를 반환해 호출자가 폴백으로 빠지도록 한다.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    rows: List[dict] = []
+
+    # 1) JSON 우선 시도.
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("items", "item", "result", "list", "data", "rows"):
+                payload = data.get(key)
+                if isinstance(payload, list):
+                    rows.extend(_normalize_worknet_item(it) for it in payload if isinstance(it, dict))
+                    break
+                if isinstance(payload, dict):
+                    rows.append(_normalize_worknet_item(payload))
+                    break
+        elif isinstance(data, list):
+            rows.extend(_normalize_worknet_item(it) for it in data if isinstance(it, dict))
+        if rows:
+            return [r for r in rows if r.get("직무명")]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 2) XML 폴백. work24 응답은 <items><item>... 또는 <list><row>... 패턴이 흔하다.
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(text)
+        for elem in root.iter():
+            if elem.tag.lower() in ("item", "row", "vo"):
+                d = {child.tag: (child.text or "") for child in elem}
+                if d:
+                    rows.append(_normalize_worknet_item(d))
+    except Exception:  # ParseError 등 — 파싱 불가 응답은 빈 결과로 처리.
+        return []
+
+    return [r for r in rows if r.get("직무명")]
+
+
+def _fetch_ncs_from_worknet(
+    keyword: str,
+    *,
+    limit: int = 5,
+    timeout: float = 8.0,
+) -> pd.DataFrame:
+    """
+    work24.go.kr 워크넷 직무사전(NCS) OpenAPI 를 키워드 기반으로 호출한다.
+
+    Args:
+        keyword: 검색 키워드 (예: '데이터분석', '소프트웨어개발', '디자인').
+        limit:   최대 반환 행 수.
+        timeout: HTTP 타임아웃(초).
+
+    Returns:
+        표준 스키마(대분류명/중분류명/소분류명/직무명/전직가능직무명) DataFrame.
+        인증키 누락·네트워크 오류·빈 응답 시 빈 DataFrame 을 돌려주어 호출자가
+        무중단으로 다음 키워드/폴백 경로로 넘어가도록 한다.
+    """
+    api_key = (getattr(config, "WORKNET_API_KEY", "") or "").strip()
+    url = getattr(config, "WORKNET_JOB_DIC", "") or ""
+    if not api_key or not url:
+        return pd.DataFrame()
+    if not keyword or not keyword.strip():
+        return pd.DataFrame()
+
+    try:
+        import requests  # 무거운 의존성이라 호출 시점에만 임포트한다.
+    except ImportError:
+        return pd.DataFrame()
+
+    kw = keyword.strip()
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "authKey": api_key,
+                "callTp": "L",
+                "returnType": "XML",
+                "startPage": 1,
+                "display": max(1, int(limit)),
+                # work24 직무사전은 서버 버전에 따라 'srchKwd' / 'keyword' / 'searchKeyword'
+                # 중 하나를 받는다. 인식 안 되는 파라미터는 서버가 무시하므로 셋 다 전송.
+                "srchKwd": kw,
+                "keyword": kw,
+                "searchKeyword": kw,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"    ⚠️ '{kw}' API 호출 실패: {e}")
+        return pd.DataFrame()
+
+    rows = _parse_worknet_response(resp.text)[: max(1, int(limit))]
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    std_cols = ("대분류명", "중분류명", "소분류명", "직무명", "전직가능직무명")
+    for col in std_cols:
+        if col not in df.columns:
+            df[col] = ""
+    return df[list(std_cols)].copy()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 기능 1) 파일 기반 코퍼스 구성
 # ──────────────────────────────────────────────────────────────────────────────
 def build_corpus_from_files() -> pd.DataFrame:
@@ -167,6 +318,8 @@ def build_corpus_from_files() -> pd.DataFrame:
         print(f"  ℹ️ master 누락 컬럼(skip): {missing}")
 
     # ── STEP 2: ncs_career_path 로드 + 컬럼 표준화 ────────────────────
+    # NCS 사전 본체는 파일 기반으로 안정 확보하고, 클라우드 환경에서는 STEP 5 의
+    # 키워드 기반 API 보강으로 도메인별 최신 직무를 추가한다.
     print("\n=== STEP 2: ncs_career_path.csv 로드 ===")
     ncs_path = os.path.join(config.RAW_DATA_DIR, "ncs_career_path.csv")
     ncs_raw = _safe_load_csv(ncs_path)
@@ -287,8 +440,44 @@ def build_corpus_from_files() -> pd.DataFrame:
 
     master["embed_text"] = master.apply(make_embed_text, axis=1)
 
-    # ── STEP 5: 길이 필터 + 저장 ──────────────────────────────────────
-    print("\n=== STEP 5: embed_text 길이 필터 및 저장 ===")
+    # ── STEP 5: 클라우드 환경 — 워크넷 API 키워드 보강 ───────────────────
+    print("\n=== STEP 5: 클라우드 API 키워드 보강 ===")
+    if IS_CLOUD:
+        print("  ☁️ 클라우드 환경 감지 — 워크넷 API 실시간 호출 시도")
+        original_len = len(master)
+        api_keywords = ["데이터분석", "소프트웨어개발", "경영기획", "디자인", "법률"]
+
+        for kw in api_keywords:
+            api_df = _fetch_ncs_from_worknet(kw, limit=5)
+            if api_df.empty:
+                continue
+
+            api_df["embed_text"] = api_df.apply(
+                lambda r: " ".join(
+                    s for s in (
+                        str(r.get("직무명", "")).strip(),
+                        str(r.get("대분류명", "")).strip(),
+                        str(r.get("소분류명", "")).strip(),
+                        str(r.get("전직가능직무명", "")).strip()[:100],
+                    ) if s and s.lower() not in ("nan", "none")
+                ).strip(),
+                axis=1,
+            )
+
+            print(f"    ✅ '{kw}': {len(api_df)}건 수집")
+            master = pd.concat([master, api_df], ignore_index=True, sort=False)
+
+        api_added = len(master) - original_len
+        print(f"  ☁️ 워크넷 API 보강 완료: +{api_added}행 추가")
+    else:
+        print("  💻 로컬 환경 — API 보강 생략 (파일 기반 코퍼스 그대로 사용)")
+
+    # ── STEP 6: embed_text 중복 제거 + 길이 필터 + 저장 ──────────────
+    print("\n=== STEP 6: 중복 제거 / 길이 필터 / 저장 ===")
+    before_dedup = len(master)
+    master = master.drop_duplicates(subset=["embed_text"], keep="first").reset_index(drop=True)
+    print(f"  🧹 embed_text 중복 제거: {before_dedup} → {len(master)}")
+
     before_filter = len(master)
     master = master[master["embed_text"].str.len() >= MIN_EMBED_TEXT_LEN].reset_index(drop=True)
     print(f"  📏 길이 < {MIN_EMBED_TEXT_LEN} 행 제거: {before_filter} → {len(master)}")
@@ -298,7 +487,7 @@ def build_corpus_from_files() -> pd.DataFrame:
     master.to_csv(out_path, index=False, encoding="utf-8-sig")
 
     avg_len = master["embed_text"].str.len().mean() if len(master) > 0 else 0
-    print(f"✅ 파일 기반 코퍼스 완성: {len(master)}행, 평균 embed_text 길이: {avg_len:.0f}자")
+    print(f"✅ 코퍼스 완성: {len(master)}행, 평균 embed_text 길이: {avg_len:.0f}자")
     print(f"   저장 경로: {out_path}")
     return master
 

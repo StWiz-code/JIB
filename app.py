@@ -177,7 +177,7 @@ with st.sidebar:
             # 2. 워크넷 직업정보 API
             try:
                 r2 = requests.get(
-                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L01.do",
+                    config.WORKNET_JOB_INFO,
                     params={
                         "authKey": config.WORKNET_API_KEY,
                         "returnType": "XML",
@@ -220,6 +220,17 @@ with st.sidebar:
 
             for name, status in results.items():
                 st.caption(f"{name}: {status}")
+
+            worknet_ok = results.get("워크넷 직무사전", "").startswith("✅")
+            claude_ok = results.get("Claude API", "").startswith("✅")
+            openai_ok = results.get("OpenAI 임베딩", "").startswith("✅")
+
+            if worknet_ok and claude_ok and openai_ok:
+                st.success("핵심 API 모두 정상 연동 중입니다.")
+            elif claude_ok and openai_ok:
+                st.info("AI 핵심 기능은 정상입니다. 워크넷 일부 API는 파일 기반으로 동작합니다.")
+            else:
+                st.warning("일부 API 연동에 문제가 있습니다. 관리자에게 문의하세요.")
 
 # ── 세션 초기화 ───────────────────────────────────────────────
 if "mode" not in st.session_state:

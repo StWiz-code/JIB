@@ -73,14 +73,14 @@ WORKNET_API_KEY: str = _env['WORKNET_API_KEY']         # 워크넷 인증키
 # ──────────────────────────────────────────────────────────────────────────────
 NCS_API_BASE: str = "https://openapi.hrdkorea.or.kr"  # HRD-Net NCS OpenAPI 베이스 URL
 
-# 워크넷 OpenAPI: 직무사전(NCS 기반)
-WORKNET_JOB_DIC: str = "https://www.work.go.kr/openApi/job/selectNcsJobDic.do"
+# 워크넷 OpenAPI: 직무사전(NCS 기반) — work24.go.kr 통합 도메인
+WORKNET_JOB_DIC: str = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L11.do"
 # 워크넷 OpenAPI: 표준직업 상세
-WORKNET_STD_JOB: str = "https://www.work.go.kr/openApi/job/selectStndJobDesc.do"
+WORKNET_STD_JOB: str = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L12.do"
 # 워크넷 OpenAPI: 직업정보(요약)
-WORKNET_JOB_INFO: str = "https://www.work.go.kr/openApi/job/selectJobInfo.do"
+WORKNET_JOB_INFO: str = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L01.do"
 # 워크넷 OpenAPI: 직업사전 상세
-WORKNET_JOB_DICT: str = "https://www.work.go.kr/openApi/job/selectDJobInfo.do"
+WORKNET_JOB_DICT: str = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L04.do"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
