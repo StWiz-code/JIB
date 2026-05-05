@@ -199,6 +199,18 @@ def generate_job_insight(
 - 요청된 내용만 바로 출력하고 전후 설명 없이 시작할 것
 - ## STEP 1. 로 시작하여 다음 단계 제안으로 끝낼 것"""
 
+    # 모드별 추가 지침 파일 로드 (있으면 system_text 에 병합)
+    # - jobseeker → generate_insight.txt (ToT/CoT/스텝백/생성지식)
+    # - counselor → counselor_script.txt (메타 프롬프팅)
+    if mode == "jobseeker":
+        insight_guide = _load_prompt("generate_insight.txt")
+        if insight_guide:
+            system_text = system_text + "\n\n" + insight_guide
+    else:
+        counselor_guide = _load_prompt("counselor_script.txt")
+        if counselor_guide:
+            system_text = system_text + "\n\n" + counselor_guide
+
     tdf = top3_df if top3_df is not None else pd.DataFrame()
 
     # STEP 3 — 모드별 유저 프롬프트
@@ -386,22 +398,19 @@ def generate_ncs_translation(ncs_terms: List[str]) -> str:
     if not ncs_terms:
         return ""
 
+    # 시스템 프롬프트는 prompts/translate_ncs.txt 우선, 없으면 기본 안내 사용
+    translation_system = _load_prompt("translate_ncs.txt")
+    if not translation_system:
+        translation_system = "NCS 용어를 현장 언어로 번역합니다."
+
     terms_text = "\n".join([f"- {t}" for t in ncs_terms])
-    prompt = f"""아래 NCS(국가직무능력표준) 용어들을 민간 채용공고에서 실제로 사용하는 현장 언어로 번역해주세요.
+    user_prompt = f"아래 NCS 용어들을 번역해주세요:\n{terms_text}"
 
-NCS 용어 목록:
-{terms_text}
-
-출력 형식 (각 줄):
-NCS용어 → 현장언어 (실무 예시: 실제 업무 1가지)
-
-조건:
-- 실제 채용공고에서 쓰이는 표현 사용
-- 이종 산업으로 적용될 수 있는 경우 이종 산업 예시도 1개 추가
-  예) "데이터베이스 구현 → SQL 기반 데이터 파이프라인 구축 (스마트팜 센서 데이터 수집에도 동일 적용 가능)"
-- 과장하지 말고 현실적으로 작성"""
-
-    return _safe_create_message(max_tokens=600, user_prompt=prompt)
+    return _safe_create_message(
+        max_tokens=800,
+        user_prompt=user_prompt,
+        system_text=translation_system,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

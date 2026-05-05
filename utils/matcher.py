@@ -31,6 +31,33 @@ import config  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 프롬프트 파일 로더 — prompts/ 하위 텍스트 파일을 시스템 프롬프트로 사용
+# ──────────────────────────────────────────────────────────────────────────────
+_PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+
+
+def _load_prompt(filename: str) -> str:
+    """
+    prompts/ 폴더에서 프롬프트 텍스트를 로드한다.
+
+    실행 디렉터리에 무관하게 프로젝트 루트 기준의 prompts/ 를 우선 시도하고,
+    그 후 현재 작업 디렉터리 기준의 상대 경로(prompts/<filename>) 도 시도한다.
+    어느 쪽에도 없으면 빈 문자열을 반환해 호출 측의 기본 프롬프트로 폴백한다.
+    """
+    candidates = [
+        _PROJECT_ROOT / "prompts" / filename,
+        Path("prompts") / filename,
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 전역 캐시 — 임베딩 DataFrame 과 L2 정규화된 벡터 행렬
 # ──────────────────────────────────────────────────────────────────────────────
 _emb_df: Optional[pd.DataFrame] = None
@@ -398,25 +425,22 @@ def expand_query_with_claude(query_text: str) -> str:
 
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
-    prompt = f"""아래 구직자 정보를 읽고, 이 사람에게 적합한 직업을 
-검색하기 위한 핵심 키워드를 추출해주세요.
+    # 시스템 프롬프트는 prompts/parse_resume.txt 우선, 없으면 기본 안내 사용
+    parse_system = _load_prompt("parse_resume.txt")
+    if not parse_system:
+        parse_system = "구직자 입력을 직업 탐색 키워드로 변환합니다."
 
-구직자 정보:
-{query_text}
-
-출력 형식 (키워드만, 설명 없이):
-- 추출할 내용: 관련 직무명, 직업군, 필요 역량, 업무 내용
-- 자격증은 해당 직무 키워드로 변환 (예: 회계1급 → 회계처리 재무제표 세무신고)
-- 30~50개 키워드를 공백으로 구분하여 한 줄로 출력
-- 직업명 후보도 포함 (예: 세무사 회계사 손해사정사)
-
-키워드 목록만 출력하고 다른 설명은 하지 마세요."""
+    user_prompt = (
+        "아래 구직자 정보를 RAG 검색 키워드로 변환해주세요:\n"
+        f"{query_text}"
+    )
 
     try:
         message = client.messages.create(
             model=config.CLAUDE_MODEL,
             max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
+            system=parse_system,
+            messages=[{"role": "user", "content": user_prompt}],
         )
         expanded = message.content[0].text.strip()
         combined = f"{query_text} {expanded}"
