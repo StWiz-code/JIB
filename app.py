@@ -1,5 +1,7 @@
 import streamlit as st
 
+import config
+
 st.set_page_config(
     page_title="JIB — Job Insight Bridge",
     page_icon="🔗",
@@ -87,6 +89,34 @@ st.markdown("""
     box-shadow: 0 2px 8px rgba(0,0,0,0.06);
     line-height: 1.8;
 }
+
+/* 모바일 반응형 — 좁은 뷰포트에서 컨테이너 패딩과 카드 폰트 축소 */
+@media (max-width: 768px) {
+    .block-container {
+        padding-left: 0.8rem !important;
+        padding-right: 0.8rem !important;
+        padding-top: 1rem !important;
+    }
+    .mode-card {
+        margin-bottom: 1rem;
+    }
+}
+
+@media (max-width: 640px) {
+    .job-card-js, .job-card-cs {
+        padding: 0.8rem !important;
+        font-size: 0.9rem;
+    }
+    .section-header-js, .section-header-cs {
+        font-size: 0.95rem !important;
+        padding: 0.5rem 0.8rem !important;
+    }
+    .insight-box {
+        padding: 1rem !important;
+        font-size: 0.9rem !important;
+        line-height: 1.7 !important;
+    }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -117,6 +147,79 @@ with st.sidebar:
     st.caption("• 고용노동통계포털 임금통계")
     st.markdown("---")
     st.caption("본 서비스는 참고용 정보를 제공하며, 직업 선택의 최종 판단은 이용자 본인에게 있습니다.")
+
+    # ── 시스템 상태 진단 (API 연동 점검) ────────────────────────
+    st.markdown("---")
+    with st.expander("🔧 시스템 상태", expanded=False):
+        if st.button("API 연동 확인", key="api_check"):
+            import requests
+            results = {}
+
+            # 1. 워크넷 직무데이터사전 API
+            try:
+                r = requests.get(
+                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L11.do",
+                    params={
+                        "authKey": config.WORKNET_API_KEY,
+                        "word": "데이터",
+                        "limit": 1,
+                        "returnType": "JSON",
+                    },
+                    timeout=5,
+                )
+                if r.status_code == 200 and len(r.text) > 50:
+                    results["워크넷 직무사전"] = "✅ 연동"
+                else:
+                    results["워크넷 직무사전"] = f"⚠️ {r.status_code}"
+            except Exception as e:
+                results["워크넷 직무사전"] = f"❌ {str(e)[:30]}"
+
+            # 2. 워크넷 직업정보 API
+            try:
+                r2 = requests.get(
+                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L01.do",
+                    params={
+                        "authKey": config.WORKNET_API_KEY,
+                        "returnType": "XML",
+                        "target": "JOBCD",
+                        "keyword": "데이터",
+                    },
+                    timeout=5,
+                )
+                if r2.status_code == 200 and len(r2.text) > 50:
+                    results["워크넷 직업정보"] = "✅ 연동"
+                else:
+                    results["워크넷 직업정보"] = f"⚠️ {r2.status_code}"
+            except Exception as e:
+                results["워크넷 직업정보"] = f"❌ {str(e)[:30]}"
+
+            # 3. OpenAI 임베딩 API
+            try:
+                from openai import OpenAI
+                client_oai = OpenAI(api_key=config.OPENAI_API_KEY)
+                client_oai.embeddings.create(
+                    model=config.EMBEDDING_MODEL,
+                    input=["test"],
+                )
+                results["OpenAI 임베딩"] = "✅ 연동"
+            except Exception as e:
+                results["OpenAI 임베딩"] = f"❌ {str(e)[:30]}"
+
+            # 4. Claude API
+            try:
+                import anthropic
+                client_cl = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+                client_cl.messages.create(
+                    model=config.CLAUDE_MODEL,
+                    max_tokens=10,
+                    messages=[{"role": "user", "content": "ping"}],
+                )
+                results["Claude API"] = "✅ 연동"
+            except Exception as e:
+                results["Claude API"] = f"❌ {str(e)[:30]}"
+
+            for name, status in results.items():
+                st.caption(f"{name}: {status}")
 
 # ── 세션 초기화 ───────────────────────────────────────────────
 if "mode" not in st.session_state:
