@@ -46,8 +46,9 @@ except Exception:  # pragma: no cover — 안전 폴백
 def load_eis_statistics(category: str = "job_demand") -> pd.DataFrame:
     """
     [Phase1 — 현재 작동]
-    EIS 고용행정통계 수동 다운로드 CSV 로더.
-    eis.work24.go.kr에서 다운로드한 통계 파일을 읽어 반환한다.
+    EIS 고용행정통계 수동 다운로드 파일 로더.
+    CSV 또는 XLSX 형식 모두 지원.
+    5년치 데이터를 직종별 평균으로 집계하여 반환.
 
     [Phase2 예정]
     EIS 공식 API 연동으로 교체 (API 개방 시).
@@ -56,56 +57,216 @@ def load_eis_statistics(category: str = "job_demand") -> pd.DataFrame:
     # params = {"category": category, "serviceKey": config.PUBLIC_DATA_API_KEY}
 
     동작:
-        1) config.EIS_STATISTICS_FILES[category] 경로의 CSV를 로드한다.
-        2) 파일이 없거나 카테고리 미정의 시 빈 DataFrame + 안내 메시지를 반환한다.
-        3) 성공 시 컬럼명 공백 제거 + object 컬럼의 숫자형 자동 변환을 수행한다.
+        1) config.EIS_STATISTICS_FILES[category] 경로의 CSV/XLSX 를 자동 탐지해 로드.
+        2) 파일이 없거나 카테고리 미정의 시 빈 DataFrame + 안내 메시지 반환.
+        3) XLSX 인 경우 피벗(연도×측정값) 형식을 long form 으로 풀고
+           직종별로 5년치 평균 구인인원 / 평균 구직건수 → 평균구인배율_EIS 계산.
 
     Args:
-        category: config.EIS_STATISTICS_FILES의 키. 기본값은 'job_demand'.
-                  현재 정의된 카테고리: 'job_demand'(직종별 구인구직), 'regional'(지역별 취업동향).
+        category: config.EIS_STATISTICS_FILES 의 키. 기본값 'job_demand'.
 
     Returns:
-        pandas.DataFrame: 정제된 통계 데이터 (없으면 빈 DataFrame).
+        pandas.DataFrame: 직종별 평균구인배율_EIS + 직종명_정제 컬럼 포함.
+                          (구인구직 측정값이 없는 일반 통계는 raw DataFrame 그대로 반환)
     """
-    files = getattr(config, "EIS_STATISTICS_FILES", {}) or {}
-    if category not in files:
-        print(f"⚠️ EIS 카테고리 '{category}'를 config.EIS_STATISTICS_FILES에서 찾을 수 없습니다.")
-        print(f"   사용 가능한 카테고리: {list(files.keys())}")
+    base_path = config.EIS_STATISTICS_FILES.get(category, "")
+    if not base_path:
+        print(f"⚠️ EIS '{category}' 설정 경로 없음")
         return pd.DataFrame()
 
-    file_path = Path(files[category])
-    if not file_path.exists():
-        print(f"⚠️ [{file_path.name}] 없음 — 빈 DataFrame 반환")
-        print(f"   eis.work24.go.kr에서 '{category}' 통계를 다운로드해 다음 경로에 저장하세요:")
-        print(f"   {file_path}")
+    # CSV/XLSX 자동 감지 — CSV 우선, 없으면 동일 경로의 .xlsx 폴백
+    csv_path = Path(base_path)
+    xlsx_path = Path(base_path.replace(".csv", ".xlsx"))
+
+    if csv_path.exists():
+        file_path = csv_path
+        file_type = "csv"
+    elif xlsx_path.exists():
+        file_path = xlsx_path
+        file_type = "xlsx"
+    else:
+        print(f"⚠️ [{Path(base_path).name}] 없음 — eis.work24.go.kr에서 다운로드 필요")
+        print(f"   저장 경로: {base_path} (또는 .xlsx)")
         return pd.DataFrame()
 
     try:
-        if _load_csv is not None:
-            df = _load_csv(file_path)
+        if file_type == "csv":
+            import chardet
+            with open(file_path, "rb") as f:
+                enc = chardet.detect(f.read(10000))["encoding"]
+            df = pd.read_csv(file_path, encoding=enc)
         else:
-            df = pd.read_csv(file_path, encoding="utf-8")
+            # EIS XLSX 구조 (직종별_구인구직현황):
+            #   row 0~12: 메타데이터 (출처·다운로드시간·필터·조회기간)
+            #   row 13  : 헤더 ['마감년월', '직종_중분류', '직종_소분류',
+            #                   '구인인원(월)', '구직건수(월)', '취업건수(월)']
+            #   row 14+ : 데이터 행 (총계 / 월별·중분류·소분류 단위)
+            df_raw = pd.read_excel(file_path, header=None, engine="openpyxl")
+            print(f"  📂 EIS XLSX 로드: {df_raw.shape}")
+
+            # 헤더 행 자동 감지 — 한 행에 '마감년월' 과 '구인'/'구직' 키워드가
+            # 동시에 등장하는 행을 찾는다.
+            header_idx = None
+            for i in range(min(50, len(df_raw))):
+                row_vals = [str(v) for v in df_raw.iloc[i].dropna()]
+                if any("마감년월" in v for v in row_vals) and any(
+                    "구인" in v for v in row_vals
+                ):
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                print("⚠️ EIS XLSX 헤더 행 자동 감지 실패 — 빈 DataFrame 반환")
+                return pd.DataFrame()
+
+            header_row = df_raw.iloc[header_idx]
+            col_index: Dict[str, int] = {}
+            for j, v in enumerate(header_row):
+                if pd.isna(v):
+                    continue
+                name = str(v).strip()
+                if "마감년월" in name:
+                    col_index["기간"] = j
+                elif "중분류" in name:
+                    col_index["중분류"] = j
+                elif "소분류" in name:
+                    col_index["소분류"] = j
+                elif "구인" in name:
+                    col_index["구인"] = j
+                elif "구직" in name:
+                    col_index["구직"] = j
+                elif "취업" in name:
+                    col_index["취업"] = j
+
+            required = {"중분류", "소분류", "구인", "구직"}
+            missing = required - col_index.keys()
+            if missing:
+                print(f"⚠️ EIS XLSX 필수 컬럼 누락: {missing} — 빈 DataFrame 반환")
+                return pd.DataFrame()
+
+            df_data = df_raw.iloc[header_idx + 1:].copy()
+            df_data.columns = range(len(df_data.columns))
+            print(f"  📂 데이터 영역: {df_data.shape} (헤더 row {header_idx} 이후)")
+
+            # Long form 레코드 생성: 행마다 직종(소분류>중분류) + 구인/구직 값 추출
+            def _strip_prefix(name: str) -> str:
+                """`'2018직종_관리직(...)'` → `'관리직(...)'` (prefix 제거)."""
+                import re
+                return re.sub(r"^\d{4}직종_", "", name).strip()
+
+            records = []
+            skipped_total = 0
+            for _, row in df_data.iterrows():
+                # 마감년월: NaN 이거나 '총계' / '... 전체' 인 행은 합계 라인이므로 제외.
+                # (단순 NaN 인 소분류 데이터 행은 통과시켜야 한다.)
+                기간_raw = row.iloc[col_index["기간"]] if "기간" in col_index else None
+                if pd.notna(기간_raw):
+                    기간 = str(기간_raw).strip()
+                    if 기간 == "총계" or "전체" in 기간:
+                        skipped_total += 1
+                        continue
+
+                중분류_raw = row.iloc[col_index["중분류"]]
+                소분류_raw = row.iloc[col_index["소분류"]]
+                중분류 = (
+                    str(중분류_raw).strip()
+                    if pd.notna(중분류_raw)
+                    else ""
+                )
+                소분류 = (
+                    str(소분류_raw).strip()
+                    if pd.notna(소분류_raw)
+                    else ""
+                )
+
+                # 합계 라인: 중분류명이 '... 전체' 로 끝나면 (소분류 NaN) 중분류 단위 합계.
+                if "전체" in 중분류 and not 소분류:
+                    skipped_total += 1
+                    continue
+                if "전체" in 소분류:
+                    skipped_total += 1
+                    continue
+
+                # 가장 구체적인 직종명: 소분류 우선, 없으면 중분류
+                if 소분류 and 소분류 not in ("nan", "None"):
+                    직종명 = _strip_prefix(소분류)
+                elif 중분류 and 중분류 not in ("nan", "None"):
+                    직종명 = _strip_prefix(중분류).replace(" 전체", "")
+                else:
+                    continue
+
+                if not 직종명 or "전체" in 직종명:
+                    continue
+
+                try:
+                    구인_v = float(row.iloc[col_index["구인"]])
+                    구직_v = float(row.iloc[col_index["구직"]])
+                except (TypeError, ValueError):
+                    continue
+
+                records.append({
+                    "직종명": 직종명,
+                    "구인인원": 구인_v,
+                    "구직건수": 구직_v,
+                })
+
+            df = pd.DataFrame(records)
+            print(f"  📊 Long form 변환: {len(df)}행 (총계/전체 {skipped_total}행 제외)")
+            # 다운스트림 호환 위해 측정값 컬럼은 그대로 두지 않고
+            # 아래 분기에서 직접 평균구인배율_EIS 를 계산해 반환한다.
+            if df.empty:
+                print("⚠️ EIS XLSX long-form 변환 결과가 비어 있음 — 빈 DataFrame 반환")
+                return pd.DataFrame()
+
+            # 직종별 5년치 평균 → 평균구인배율_EIS
+            grouped = df.groupby("직종명").agg(
+                평균구인인원=("구인인원", "mean"),
+                평균구직건수=("구직건수", "mean"),
+            )
+            grouped["평균구인배율_EIS"] = (
+                grouped["평균구인인원"] / grouped["평균구직건수"]
+            ).replace([float("inf"), float("nan")], 0).round(3)
+            grouped = grouped.reset_index()
+            grouped["직종명_정제"] = grouped["직종명"]
+            print(
+                f"✅ EIS '{category}' 구인배율 계산 완료: "
+                f"{len(grouped)}개 직종"
+            )
+            print(
+                grouped[["직종명_정제", "평균구인배율_EIS"]]
+                .head(10)
+                .to_string(index=False)
+            )
+            return grouped
+
     except Exception as e:
-        print(f"⚠️ [{file_path.name}] 로드 실패 ({e}) — 빈 DataFrame 반환")
+        print(f"⚠️ EIS 파일 로드 실패: {e}")
         return pd.DataFrame()
 
-    df.columns = [str(c).strip() for c in df.columns]
-    # 숫자형 자동 변환 — 단, 컬럼명에 '코드'/'code'가 있으면 식별자로 보고 문자열 유지.
-    # (직종코드/직업코드 같은 컬럼은 외형은 숫자여도 join 키로 쓰여야 함)
-    for col in df.columns:
-        if df[col].dtype != "object":
-            continue
-        if any(token in str(col).lower() for token in ("코드", "code")):
-            continue
-        try:
-            df[col] = pd.to_numeric(df[col])
-        except (ValueError, TypeError):
-            pass
+    # 측정값 컬럼이 있으면 직종별 5년치 평균 → 구인배율_EIS 계산
+    if "측정값" in df.columns and "직종명" in df.columns:
+        구인 = df[df["측정값"].str.contains("구인", na=False)].groupby("직종명")["값"].mean()
+        구직 = df[df["측정값"].str.contains("구직", na=False)].groupby("직종명")["값"].mean()
 
-    print(
-        f"✅ [{file_path.name}] EIS 통계 로드 완료: "
-        f"{len(df):,}행 × {df.shape[1]}컬럼 (category='{category}')"
-    )
+        result = pd.DataFrame({"평균구인인원": 구인, "평균구직건수": 구직}).dropna()
+        result["평균구인배율_EIS"] = (
+            result["평균구인인원"] / result["평균구직건수"]
+        ).replace([float("inf"), float("nan")], 0).round(3)
+        result = result.reset_index()
+
+        # 직종명 정제 (앞 숫자 코드 제거: "01 관리직" → "관리직")
+        result["직종명_정제"] = (
+            result["직종명"].str.replace(r"^\d{2,3}\s*", "", regex=True).str.strip()
+        )
+
+        print(f"✅ EIS '{category}' 구인배율 계산 완료: {len(result)}개 직종")
+        print(result[["직종명_정제", "평균구인배율_EIS"]].head(10).to_string(index=False))
+        return result
+
+    # 기본 전처리 (컬럼명 공백 제거)
+    if hasattr(df.columns, "str"):
+        df.columns = df.columns.str.strip()
+    print(f"✅ EIS '{category}' 로드 완료: {len(df)}행")
     return df
 
 

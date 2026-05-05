@@ -13,7 +13,6 @@ __pycache__/
 
 # 원본 데이터 (용량 크고 재배포 불필요)
 data/raw/
-data/eis/
 
 # IDE
 .vscode/

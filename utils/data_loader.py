@@ -2135,7 +2135,7 @@ def build_master_with_eis(
                           기준 마스터가 비어 있으면 빈 DataFrame.
     """
     # 순환 임포트 방지를 위한 함수 내부 lazy import
-    from utils.eis_loader import merge_eis_to_master
+    from utils.eis_loader import load_eis_statistics, merge_eis_to_master
 
     print("\n[build_master_with_eis] (1/2) 기준 마스터 데이터 생성")
     master = build_master_job_data()
@@ -2146,8 +2146,51 @@ def build_master_with_eis(
 
     print(f"\n[build_master_with_eis] (2/2) EIS 보완 병합 — 카테고리: {list(eis_categories)}")
     cols_before = master.shape[1]
+
     for category in eis_categories:
-        master = merge_eis_to_master(master, category=category)
+        eis_df = load_eis_statistics(category)
+
+        if eis_df.empty:
+            print(f"⏸ EIS '{category}' 데이터 없음 — 건너뜀")
+            continue
+
+        # ── 새 로직: 평균구인배율_EIS 컬럼이 있으면 직종명_정제 ↔ 대분류명/중분류명
+        # contains 매칭으로 평균구인배율 빈 곳을 보완 ────────────────────
+        if "평균구인배율_EIS" in eis_df.columns and "직종명_정제" in eis_df.columns:
+            eis_rate_map = dict(
+                zip(eis_df["직종명_정제"], eis_df["평균구인배율_EIS"])
+            )
+            보완_count = 0
+            for idx, row in master.iterrows():
+                # 기존 평균구인배율이 NaN 이거나 0 인 경우만 보완 대상
+                current = row.get("평균구인배율", None)
+                try:
+                    if pd.notna(current) and float(current) != 0:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+                대분류 = str(row.get("대분류명", ""))
+                중분류 = str(row.get("중분류명", ""))
+
+                for eis_name, rate in eis_rate_map.items():
+                    if not eis_name:
+                        continue
+                    if (
+                        eis_name in 대분류
+                        or eis_name in 중분류
+                        or (대분류 and 대분류 in eis_name)
+                        or (중분류 and 중분류 in eis_name)
+                    ):
+                        master.at[idx, "평균구인배율"] = rate
+                        보완_count += 1
+                        break
+
+            print(f"✅ EIS '{category}' 구인배율 보완: {보완_count}건 추가 매핑")
+        else:
+            # 레거시 경로: 직종코드/직업코드/직종명 join 가능한 형식이면 그대로 병합
+            master = merge_eis_to_master(master, category=category)
+
     cols_added = master.shape[1] - cols_before
 
     if save:
