@@ -96,7 +96,7 @@ def load_eis_statistics(category: str = "job_demand") -> pd.DataFrame:
                 enc = chardet.detect(f.read(10000))["encoding"]
             df = pd.read_csv(file_path, encoding=enc)
         else:
-            # EIS XLSX 구조 (직종별_구인구직현황):
+            # EIS XLSX 구조 (employment_demand_supply_5y, 구 직종별_구인구직현황):
             #   row 0~12: 메타데이터 (출처·다운로드시간·필터·조회기간)
             #   row 13  : 헤더 ['마감년월', '직종_중분류', '직종_소분류',
             #                   '구인인원(월)', '구직건수(월)', '취업건수(월)']

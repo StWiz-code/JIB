@@ -33,6 +33,7 @@ def _load_env() -> dict:
         'ANTHROPIC_API_KEY',
         'PUBLIC_DATA_API_KEY',
         'WORKNET_API_KEY',
+        'WORKNET_API_KEY_JOB',
     ]
 
     # 1순위: Streamlit secrets (배포 환경)
@@ -64,7 +65,11 @@ _env = _load_env()
 OPENAI_API_KEY: str = _env['OPENAI_API_KEY']           # OpenAI 임베딩/LLM 키
 ANTHROPIC_API_KEY: str = _env['ANTHROPIC_API_KEY']     # Claude(Anthropic) 키
 PUBLIC_DATA_API_KEY: str = _env['PUBLIC_DATA_API_KEY'] # 공공데이터포털 인증키
+# 워크넷 API 키 (215번대 - L11 직무데이터사전, 215L01 표준직무기술서 공유)
 WORKNET_API_KEY: str = _env['WORKNET_API_KEY']         # 워크넷 인증키
+# 워크넷 API 키 (212번대 - 직업정보 212L01, 직업사전 212L50)
+# 별도 신청·승인이 필요한 서비스이므로 미발급 시 빈 문자열로 유지된다.
+WORKNET_API_KEY_JOB: str = _env['WORKNET_API_KEY_JOB']  # 워크넷 직업정보(212) 인증키
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -90,9 +95,10 @@ WORKNET_JOB_DICT: str = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApi
 EIS_DATA_DIR: str = "data/eis/"  # EIS 수동 다운로드 파일 보관 디렉터리
 
 # EIS 고용행정통계 정적 파일 경로 매핑 (현재: 수동 CSV / [Phase2 예정] API 연동)
+# 값은 .csv 기준 경로이며, 파일 미존재 시 동일 stem 의 .xlsx 가 자동 폴백된다.
 EIS_STATISTICS_FILES: Dict[str, str] = {
-    "job_demand": "data/eis/직종별_구인구직현황.csv",  # 직종별 구인구직 현황
-    "regional": "data/eis/지역별_취업동향.csv",        # 지역별 취업 동향
+    "job_demand": EIS_DATA_DIR + "employment_demand_supply_5y.csv",  # 직종별 구인·구직 5년치
+    "regional": EIS_DATA_DIR + "지역별_취업동향.csv",                 # 지역별 취업 동향
 }
 
 # ELDS 연동 시 사용할 설정값 # [Phase3 예정] 연구 협약 승인 후 입력

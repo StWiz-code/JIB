@@ -168,6 +168,75 @@ def embed_query(text: str) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 학력 적합도 헬퍼
+#   사용자 입력 텍스트에서 학력 키워드를 추출해 0~6 학력점수로 환산하고,
+#   직업 평균 학력점수와의 거리 기반으로 -0.03 ~ +0.05 범위의 가산 점수를 산출.
+# ──────────────────────────────────────────────────────────────────────────────
+def extract_education_score(text: str) -> Optional[float]:
+    """사용자 입력 텍스트에서 학력 정보를 추출해 학력 점수(0~6) 로 환산한다.
+
+    학력 키워드 매핑 (우선순위: 높은 학력일수록 먼저 매칭):
+        박사 / phd / ph.d                          → 6
+        대학원 / 석사 / master                       → 5
+        대졸 / 학사 / 4년제 / 대학교 / 대학 졸업      → 4
+        전문대 / 전문학사 / 2년제 / 3년제             → 3
+        고졸 / 고등학교 / 고교 졸업 / 직업교육 / 직업훈련 → 2
+        중졸 / 중학교                               → 0
+
+    Returns:
+        Optional[float]: 학력 점수(0~6). 키워드를 못 찾으면 None.
+    """
+    if not text or not isinstance(text, str):
+        return None
+
+    s = text.lower()
+
+    priority_keywords = [
+        (["박사", "phd", "ph.d"], 6),
+        (["대학원", "석사", "master"], 5),
+        (["대졸", "학사", "4년제", "4년 제", "대학교", "대학 졸업"], 4),
+        (["전문대", "전문학사", "2년제", "3년제", "2년 제", "3년 제"], 3),
+        (["고졸", "고등학교", "고교 졸업", "직업교육", "직업훈련"], 2),
+        (["중졸", "중학교"], 0),
+    ]
+
+    for keywords, score in priority_keywords:
+        for kw in keywords:
+            if kw in s:
+                return float(score)
+
+    return None
+
+
+def compute_education_fit(
+    user_edu_score: Optional[float],
+    job_edu_score: Optional[float],
+) -> float:
+    """사용자 학력 점수와 직업 평균 학력 점수의 적합도를 -0.03 ~ +0.05 범위로 산출한다.
+
+    적용 규칙:
+        - 차이 ±1 이내           : +0.05 (가산점)
+        - 차이 ±2 이내           : +0.02
+        - 직업이 사용자보다 2 초과 → -0.03 (진입 어려움)
+        - 사용자가 직업보다 2 초과 →  0.00 (오버스펙 허용)
+        - 입력 None              :  0.00 (보너스 미적용)
+    """
+    if user_edu_score is None or job_edu_score is None:
+        return 0.0
+
+    # diff > 0: 직업 요구가 더 높음, diff < 0: 사용자가 더 높음
+    diff = job_edu_score - user_edu_score
+
+    if abs(diff) <= 1:
+        return 0.05
+    if abs(diff) <= 2:
+        return 0.02
+    if diff > 2:
+        return -0.03
+    return 0.0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 기능 3) 유사도 기반 TOP-K 후보 추출
 # ──────────────────────────────────────────────────────────────────────────────
 def find_similar_jobs(
@@ -225,7 +294,11 @@ def find_similar_jobs(
 
     return_cols = [
         "직업코드", "직업명", "유사도", "대분류명", "중분류명",
-        "전망점수", "평균구인배율", "평균부족률", "월평균임금_천원",
+        "전망점수", "평균구인배율", "평균부족률",
+        "월평균임금_천원", "신입임금_천원",
+        "상위25_임금_천원", "중위_임금_천원", "하위25_임금_천원",
+        "주요학력수준", "학력_고졸이하비율", "학력_전문대졸비율",
+        "학력_대졸이상비율", "학력점수",
         "직업전망_텍스트", "주요전공계열", "유사직업명_합산",
     ]
     exist_cols = [c for c in return_cols if c in result.columns]
@@ -243,6 +316,7 @@ def find_similar_jobs(
 def filter_top3(
     candidates_df: pd.DataFrame,
     user_wage_floor: Optional[float] = None,
+    user_edu_score: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     find_similar_jobs() 후보에서 다중지표 가중치 채점으로 TOP-N 을 확정한다.
@@ -251,13 +325,16 @@ def filter_top3(
         score = 유사도   * config.WEIGHT_SIMILARITY
               + 수요점수 * config.WEIGHT_DEMAND
               + 임금점수 * config.WEIGHT_WAGE
+              + 학력적합도 (-0.03 ~ +0.05, user_edu_score 미지정 시 0)
 
     Args:
         candidates_df:  find_similar_jobs() 결과 DataFrame
         user_wage_floor: 사용자가 지정한 임금 하한선(천원). 미지정 시 미적용.
+        user_edu_score:  사용자 학력 점수(0~6). compute_education_fit() 로
+                         '학력점수' 컬럼과 비교해 -0.03 ~ +0.05 범위의 가산점.
 
     Returns:
-        pandas.DataFrame: 최종 TOP-N + '수요점수/임금점수/최종점수/추천순위' 컬럼.
+        pandas.DataFrame: 최종 TOP-N + '수요점수/임금점수/학력적합도/최종점수/추천순위'.
     """
     if candidates_df is None or candidates_df.empty:
         return candidates_df if candidates_df is not None else pd.DataFrame()
@@ -371,6 +448,19 @@ def filter_top3(
     df["수요점수"] = df.apply(calc_demand_score, axis=1)
     df["임금점수"] = df.apply(calc_wage_score, axis=1)
 
+    # ── 학력 적합도 (사용자 입력 학력 ↔ 직업 평균 학력점수) ──────────
+    # 가산 점수 형태로 -0.03 ~ +0.05 범위를 갖는다. user_edu_score 가
+    # None 이거나 후보에 '학력점수' 컬럼이 없으면 0.0 으로 미적용.
+    if user_edu_score is not None and "학력점수" in df.columns:
+        edu_series = pd.to_numeric(df["학력점수"], errors="coerce")
+        df["학력적합도"] = edu_series.apply(
+            lambda x: compute_education_fit(user_edu_score, float(x))
+            if pd.notna(x) else 0.0
+        )
+        print(f"  🎓 학력 적합도 평균: {df['학력적합도'].mean():+.3f}")
+    else:
+        df["학력적합도"] = 0.0
+
     # 유사도가 누락된 행 대비 안전 변환.
     sim_series = pd.to_numeric(df.get("유사도", pd.Series(dtype=float)), errors="coerce").fillna(0.0)
 
@@ -378,6 +468,7 @@ def filter_top3(
         sim_series * config.WEIGHT_SIMILARITY
         + df["수요점수"] * config.WEIGHT_DEMAND
         + df["임금점수"] * config.WEIGHT_WAGE
+        + df["학력적합도"]
     )
 
     top_n = config.TOP_N_RESULTS
@@ -466,6 +557,12 @@ def search_jobs(
     use_query_expansion=True (기본값) 시 expand_query_with_claude() 로
     쿼리를 한 번 확장한 뒤 임베딩 매칭에 사용한다 (기법④ STEP 1).
     """
+    # 학력 키워드는 Claude 확장 단계에서 의역·삭제될 수 있으므로
+    # 항상 원본 query_text 기준으로 추출한다.
+    user_edu_score = extract_education_score(query_text)
+    if user_edu_score is not None:
+        print(f"  🎓 사용자 학력 점수: {user_edu_score} (텍스트에서 자동 추출)")
+
     if use_query_expansion:
         print("  📝 구직자 입력을 직업 탐색 언어로 변환 중...")
         search_text = expand_query_with_claude(query_text)
@@ -483,7 +580,11 @@ def search_jobs(
         print("⚠️ 유사도 임계값 이상의 후보가 없습니다.")
         return pd.DataFrame()
 
-    result = filter_top3(candidates, user_wage_floor=user_wage_floor)
+    result = filter_top3(
+        candidates,
+        user_wage_floor=user_wage_floor,
+        user_edu_score=user_edu_score,
+    )
     print(f"✅ TOP {len(result)} 직업 선정 완료")
     return result
 
@@ -516,6 +617,11 @@ if __name__ == "__main__":
         print(f"원문: {query[:80]}")
         print("-" * 40)
 
+        # 학력 점수는 원본 query 에서 추출 (확장 후엔 키워드가 의역될 수 있음).
+        user_edu_score = extract_education_score(query)
+        if user_edu_score is not None:
+            print(f"  🎓 사용자 학력 점수: {user_edu_score} (텍스트에서 자동 추출)")
+
         # STEP 1) 쿼리 확장 (Claude 호출 1회) — 결과를 출력 후 매칭에 재사용.
         expanded = expand_query_with_claude(query)
         print(f"확장 결과: {expanded[:150]}...")
@@ -538,7 +644,7 @@ if __name__ == "__main__":
                 f"  [진단] 상위 5개:\n"
                 f"{candidates.head(5)[['직업명', '유사도']].to_string(index=False)}"
             )
-            result = filter_top3(candidates)
+            result = filter_top3(candidates, user_edu_score=user_edu_score)
             print(f"✅ TOP {len(result)} 직업 선정 완료")
         else:
             result = pd.DataFrame()

@@ -1,3 +1,4 @@
+import html
 import streamlit as st
 import pandas as pd
 from utils.matcher import search_jobs
@@ -5,6 +6,7 @@ from utils.claude_generator import (
     generate_job_insight,
     generate_counselor_questions,
     generate_ncs_translation,
+    fetch_worknet_supplementary,
 )
 
 PROSPECT_LABEL = {
@@ -150,6 +152,17 @@ def render():
                 st.warning("적합한 직업을 찾지 못했습니다.")
                 return
 
+            # 워크넷 OpenAPI 실시간 보강 (212L01 직업정보 + 212L50 직업사전).
+            # TOP3 직업명 기준 hash 키로 세션 캐시 → 동일 결과 재조회 방지.
+            worknet_cache_key = (
+                f"worknet_data_{hash(tuple(top3['직업명'].tolist()))}"
+            )
+            if worknet_cache_key not in st.session_state:
+                with st.spinner("관련 직업 정보 조회 중..."):
+                    st.session_state[worknet_cache_key] = (
+                        fetch_worknet_supplementary(top3, max_related=3)
+                    )
+
             result = {}
             if show_guide:
                 with st.spinner("상담 가이드를 생성하는 중... (30~60초 소요)"):
@@ -163,6 +176,12 @@ def render():
     result = st.session_state.get("cs_result", {})
 
     if not top3.empty:
+        # 세션 캐시에서 워크넷 보강 데이터 조회 (없으면 빈 dict 폴백 → expander 미노출)
+        worknet_cache_key = (
+            f"worknet_data_{hash(tuple(top3['직업명'].tolist()))}"
+        )
+        worknet_data = st.session_state.get(worknet_cache_key, {})
+
         # 데이터 대시보드
         st.markdown('<div class="section-header-cs">📊 역량 매칭 데이터 대시보드</div>',
                    unsafe_allow_html=True)
@@ -176,8 +195,20 @@ def render():
             구인배율 = row.get('평균구인배율', None)
             부족률 = row.get('평균부족률', None)
             임금 = row.get('월평균임금_천원', None)
+            신입임금 = row.get('신입임금_천원', None)
             대분류 = row.get('대분류명', '')
             중분류 = row.get('중분류명', '')
+
+            # 학력 분포 파생 컬럼
+            주요학력 = row.get('주요학력수준')
+            대졸이상비율 = row.get('학력_대졸이상비율')
+            전문대졸비율 = row.get('학력_전문대졸비율')
+            고졸이하비율 = row.get('학력_고졸이하비율')
+            학력적합도 = row.get('학력적합도', 0.0)
+            try:
+                학력적합도 = float(학력적합도) if pd.notna(학력적합도) else 0.0
+            except (TypeError, ValueError):
+                학력적합도 = 0.0
 
             def clean_str(val):
                 s = str(val).strip()
@@ -235,35 +266,143 @@ def render():
                     부족 = "—"
             else:
                 부족 = "—"
-            if pd.notna(임금) and w > 0:
-                임금_t = (
-                    f"월 {int(w):,}천원"
-                    f'<br><small style="color:#888;">(중분류 평균 기준)</small>'
-                )
+            월평균 = 임금
+            if pd.notna(월평균) and w > 0:
+                avg_str = f"**{int(w):,}천원**"
+                try:
+                    신입_f = float(신입임금) if pd.notna(신입임금) else 0.0
+                except (TypeError, ValueError):
+                    신입_f = 0.0
+                if pd.notna(신입임금) and 신입_f > 0:
+                    # 청년 임금 격차 계산
+                    격차_pct = round((1 - 신입_f / w) * 100)
+                    격차_color = "#888" if 격차_pct < 30 else "#c44"
+                    wage_html = (
+                        f"💰 직종 평균 {avg_str} | "
+                        f"신입(1~3년) **{int(신입_f):,}천원** "
+                        f"<span style='color:{격차_color}; font-size:0.88em;'>"
+                        f"(격차 {격차_pct}%)"
+                        f"</span>"
+                    )
+                else:
+                    wage_html = f"💰 직종 평균 {avg_str}"
             else:
-                임금_t = "—"
+                wage_html = "💰 <span style='color:#999;'>임금 정보 없음</span>"
 
             with cols[idx]:
                 rank_num = ["1️⃣", "2️⃣", "3️⃣"][idx]
                 st.markdown(f"""
 <div class="job-card-cs">
-<div style="font-size:1.3rem;">{rank_num}</div>
-<div style="font-size:1.15rem; font-weight:700; color:#1A1A1A; margin:0.3rem 0;">
+<div style="font-size:clamp(1rem, 4vw, 1.3rem);">{rank_num}</div>
+<div style="font-size:clamp(0.95rem, 3vw, 1.15rem); font-weight:700; color:#1A1A1A; margin:0.3rem 0;">
 {직업명}
 </div>
-<div style="font-size:0.85rem; color:#555; margin-bottom:0.8rem;">
+<div style="font-size:clamp(0.8rem, 2.5vw, 0.85rem); color:#555; margin-bottom:0.8rem;">
 {분류_text}
 </div>
-<div style="display:grid; grid-template-columns:1fr 1fr; gap:0.4rem; font-size:0.85rem;">
+<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(100px, 1fr)); gap:0.4rem; font-size:clamp(0.8rem, 2.5vw, 0.85rem);">
 <div>🎯 <b>적합도</b><br>{유사도_f:.1%}</div>
 <div>📌 <b>종합점수</b><br>{최종_f:.3f}</div>
 <div>📈 <b>전망</b><br>{전망_html}</div>
 <div>📊 <b>구인배율</b><br>{배율}</div>
 <div>⚡ <b>부족률</b><br>{부족}</div>
-<div>💰 <b>평균임금</b><br>{임금_t}</div>
 </div>
 </div>
 """, unsafe_allow_html=True)
+
+                st.markdown(wage_html, unsafe_allow_html=True)
+
+                # 분위 임금 분포 (wage_by_job.csv 매칭된 직업만)
+                상위25 = row.get('상위25_임금_천원')
+                중위 = row.get('중위_임금_천원')
+                하위25 = row.get('하위25_임금_천원')
+                if pd.notna(상위25) and pd.notna(중위) and pd.notna(하위25):
+                    범위_html = (
+                        f"📊 임금 분포: "
+                        f"<span style='color:#888;'>하위 {int(하위25):,}</span> · "
+                        f"<b>중위 {int(중위):,}</b> · "
+                        f"<span style='color:#5a8a7e;'>상위 {int(상위25):,}</span> 천원"
+                    )
+                    st.markdown(범위_html, unsafe_allow_html=True)
+
+                # 학력 분포 inline 표시 (주요학력수준 + 비중 + 적합도 라벨)
+                if pd.notna(주요학력):
+                    if 학력적합도 >= 0.05:
+                        fit_label = "<span style='color:#5a8a7e;'>✓ 학력 적합</span>"
+                    elif 학력적합도 >= 0.02:
+                        fit_label = "<span style='color:#9c8a4a;'>△ 약간 차이</span>"
+                    elif 학력적합도 < 0:
+                        fit_label = "<span style='color:#c44;'>⚠ 진입 어려움</span>"
+                    else:
+                        fit_label = ""
+
+                    if 주요학력 in ('대졸', '대학원졸', '박사졸') and pd.notna(대졸이상비율):
+                        ratio_str = f"({int(round(float(대졸이상비율) * 100))}%)"
+                    elif 주요학력 == '전문대졸' and pd.notna(전문대졸비율):
+                        ratio_str = f"({int(round(float(전문대졸비율) * 100))}%)"
+                    elif 주요학력 in ('고졸', '중졸이하') and pd.notna(고졸이하비율):
+                        ratio_str = f"({int(round(float(고졸이하비율) * 100))}%)"
+                    else:
+                        ratio_str = ""
+
+                    edu_html = (
+                        f"🎓 주요 학력: <b>{주요학력}</b> {ratio_str} {fit_label}".strip()
+                    )
+                    st.markdown(edu_html, unsafe_allow_html=True)
+
+                    with st.expander("🎓 학력 분포 상세"):
+                        if pd.notna(고졸이하비율):
+                            st.markdown(
+                                f"- **고졸 이하**: {int(round(float(고졸이하비율) * 100))}%"
+                            )
+                        if pd.notna(전문대졸비율):
+                            st.markdown(
+                                f"- **전문대졸**: {int(round(float(전문대졸비율) * 100))}%"
+                            )
+                        if pd.notna(대졸이상비율):
+                            st.markdown(
+                                f"- **대졸 이상**: {int(round(float(대졸이상비율) * 100))}%"
+                            )
+                        st.caption(
+                            "출처: 한국고용정보원 KNOW 직업정보 — "
+                            "직업별 교육훈련 및 학력 분포"
+                        )
+                        st.caption("※ 본 직업 종사자의 실제 학력 분포 (응답자 기준)")
+
+                # 워크넷 OpenAPI(212L01/212L50)로 가져온 관련 직업 정보 표시
+                worknet_info = worknet_data.get(직업명, {})
+                if worknet_info.get("related_jobs") or worknet_info.get("official_name"):
+                    with st.expander("🔗 관련 직업 정보 (워크넷 실시간)"):
+                        official = worknet_info.get("official_name", "")
+                        if official and official != 직업명:
+                            st.markdown(f"**워크넷 공식 직업명**: {official}")
+                        category = worknet_info.get("category_name", "")
+                        if category:
+                            st.markdown(f"**직업 분류**: {category}")
+                        related = worknet_info.get("related_jobs") or []
+                        if related:
+                            st.markdown(
+                                f"**관련 세부 직업**: {', '.join(related)}"
+                            )
+                        st.caption(
+                            "출처: 한국고용정보원 워크넷 직업정보 API (212L01) "
+                            "+ 직업사전 API (212L50)"
+                        )
+
+        with st.expander("💡 임금 정보 — 상담 활용 가이드", expanded=False):
+            st.markdown('''
+**📊 직종 평균**: 표준직업분류 7차 기준 5년치 평균 (전경력 종사자)
+**🌱 신입 임금**: 경력 1~3년 미만 종사자 평균
+**📉 격차**: 신입과 평균의 비율
+
+#### 상담 활용 포인트
+- **격차 30% 이상**: 입직 후 일정 기간 임금 상승이 큰 직종 → 장기 비전 강조
+- **격차 20% 이하**: 신입과 베테랑 차이가 적은 안정 직종 → 초기 진입 매력 강조
+- **임금 정보 없음**: 표준분류에 없는 신생 직군 또는 매핑 보완 필요
+
+> *출처: 고용노동부 고용노동통계포털 — 직종별 임금 및 근로시간 (2020~2025년)*
+> *내담자에게 안내 시 "동일 직종 내에서도 기업·지역·역량에 따라 편차가 큽니다" 부연 권장*
+''')
 
         with st.expander("📌 표시 데이터 출처 및 해석 안내", expanded=False):
             st.markdown(
@@ -299,9 +438,49 @@ def render():
                 '<div class="section-header-cs">🤖 AI 상담 가이드</div>',
                 unsafe_allow_html=True,
             )
+            # 모바일에서 마크다운 가독성 보강 (헤딩/문단/리스트 폰트 축소)
+            st.markdown("""
+<style>
+@media (max-width: 640px) {
+    .stMarkdown p {
+        font-size: 0.9rem !important;
+        line-height: 1.7 !important;
+    }
+    .stMarkdown h2, .stMarkdown h3 {
+        font-size: 1.05rem !important;
+    }
+    .stMarkdown li {
+        font-size: 0.88rem !important;
+        line-height: 1.6 !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
             insight_text = result.get("insight_text", "")
             if insight_text:
-                st.markdown(insight_text)
+                steps = insight_text.split("---")
+
+                if len(steps) >= 3:
+                    with st.expander("🔍 STEP 1. AI 3관점 분석 과정 (클릭하여 펼치기)", expanded=False):
+                        st.markdown(steps[0] if steps[0].strip() else "")
+                        st.caption(
+                            "역량·시장·임금 3가지 관점에서 독립적으로 분석한 결과입니다."
+                        )
+
+                    with st.expander("⚖️ STEP 2. 교차검증 결과 (클릭하여 펼치기)", expanded=False):
+                        st.markdown(steps[1] if len(steps) > 1 else "")
+                        st.caption(
+                            "3관점 결과를 교차검증하여 추천 우선순위를 조정한 결과입니다."
+                        )
+
+                    st.markdown(
+                        '<div class="section-header-cs">📋 최종 상담 가이드</div>',
+                        unsafe_allow_html=True,
+                    )
+                    final_content = "---".join(steps[2:]) if len(steps) > 2 else insight_text
+                    st.markdown(final_content)
+                else:
+                    st.markdown(insight_text)
             else:
                 st.warning("상담 가이드 생성에 실패했습니다.")
 
@@ -337,13 +516,41 @@ def render():
                         st.session_state.get("cs_last_query", "")
                     )
                 st.markdown(
-                    f'<div class="insight-box">'
-                    f'<b>"{job_for_q}" 탐색을 위한 열린 질문</b><br><br>'
-                    + "".join([
-                        f'<div style="padding:0.4rem 0; border-bottom:1px solid #EEE;">'
-                        f'• {q}</div>'
-                        for q in questions
-                    ])
-                    + '</div>',
-                    unsafe_allow_html=True
+                    f'<p style="font-weight:600; color:#1A1A1A; margin:0 0 0.5rem 0;">'
+                    f'"{html.escape(job_for_q)}" 탐색을 위한 열린 질문</p>',
+                    unsafe_allow_html=True,
                 )
+                st.markdown("""
+<div style="background:#EEF3FF; border-radius:8px;
+            padding:0.8rem 1rem; margin-bottom:0.8rem;
+            font-size:0.85rem; color:#2C4F8A;
+            border-left:3px solid #2C4F8A;">
+<b>💡 열린 질문 활용 가이드</b><br>
+아래 질문들은 내담자가 스스로 강점을 발견하도록 돕는 도구입니다.<br>
+- <b>첫 번째 질문</b>: 내담자의 과거 경험에서 강점을 끌어냅니다<br>
+- <b>두 번째 질문</b>: 해당 직업에 대한 자연스러운 관심을 탐색합니다<br>
+- <b>세 번째 질문</b>: 현실적 장애물을 함께 탐색합니다<br><br>
+<i>질문 후 내담자의 답변을 충분히 경청하고, 답변 내용을 다음 질문의 근거로 활용하세요.</i>
+</div>
+""", unsafe_allow_html=True)
+
+                hints = [
+                    "경청 포인트: 내담자가 언급하는 감정 단어에 주목하세요",
+                    "탐색 포인트: 구체적 경험이나 사례를 더 물어보세요",
+                    "현실화 포인트: 내담자의 현실적 우려를 인정하며 가능성을 함께 탐색하세요",
+                ]
+                for i, q in enumerate(questions):
+                    hint = hints[i] if i < len(hints) else ""
+                    q_safe = html.escape(str(q))
+                    st.markdown(f"""
+<div style="background:white; border-radius:8px; padding:0.8rem 1rem;
+            margin-bottom:0.6rem; border-left:3px solid #3D6BB0;
+            box-shadow:0 1px 4px rgba(0,0,0,0.06);">
+<div style="font-weight:600; color:#1A1A1A; margin-bottom:0.3rem;">
+Q{i + 1}. {q_safe}
+</div>
+<div style="font-size:0.8rem; color:#666; font-style:italic;">
+💬 {hint}
+</div>
+</div>
+""", unsafe_allow_html=True)

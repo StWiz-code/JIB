@@ -120,6 +120,125 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── API 진단 헬퍼 ─────────────────────────────────────────────
+# 사이드바 시스템 상태 진단에서 사용한다. 각 헬퍼는 (emoji, "name: status")
+# 형태의 튜플을 반환해 호출 측에서 일관된 형식으로 렌더할 수 있도록 한다.
+def _check_worknet_api(
+    api_key: str,
+    *,
+    name: str,
+    timeout: float = 5.0,
+) -> tuple:
+    """워크넷 215L11 직무데이터사전 API 헬스체크."""
+    import requests
+
+    if not api_key:
+        return ("⚠️", f"{name}: 인증키 없음 (WORKNET_API_KEY)")
+    try:
+        r = requests.get(
+            "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L11.do",
+            params={
+                "authKey": api_key,
+                "word": "데이터",
+                "limit": 1,
+                "returnType": "JSON",
+            },
+            timeout=timeout,
+        )
+        if r.status_code == 200 and len(r.text) > 50:
+            return ("✅", f"{name}: 정상")
+        return ("⚠️", f"{name}: HTTP {r.status_code}")
+    except Exception as e:
+        return ("❌", f"{name}: {str(e)[:50]}")
+
+
+def _check_worknet_212_api(
+    url: str,
+    name: str,
+    params_extra: dict,
+    *,
+    timeout: float = 5.0,
+) -> tuple:
+    """워크넷 212번대 API (직업정보 212L01, 직업사전 212L50) 헬스체크.
+
+    XML 응답을 정확히 파싱해 다음을 구분한다.
+        1) <error> 태그 → 활용 미신청 / 인증 오류 등 명시적 실패
+        2) <total> 노드 → 결과 건수와 함께 정상
+        3) <jobList>·<dJobList> 노드 → 정상
+        4) 그 외 빈 응답 → 정상이지만 결과 없음
+    """
+    import requests
+    import xml.etree.ElementTree as ET
+
+    api_key = (getattr(config, "WORKNET_API_KEY_JOB", "") or "").strip()
+    if not api_key:
+        return ("⚠️", f"{name}: 인증키 없음 (WORKNET_API_KEY_JOB)")
+    try:
+        params = {"authKey": api_key, **params_extra}
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            return ("⚠️", f"{name}: HTTP {r.status_code}")
+
+        try:
+            root = ET.fromstring(r.text)
+        except ET.ParseError:
+            return ("⚠️", f"{name}: 응답 파싱 실패")
+
+        error_node = root.find(".//error")
+        if error_node is not None and (error_node.text or "").strip():
+            return ("⚠️", f"{name}: {error_node.text.strip()[:30]}")
+
+        total_node = root.find(".//total")
+        if total_node is not None:
+            total_text = (total_node.text or "0").strip()
+            return ("✅", f"{name}: 정상 (총 {total_text}건)")
+
+        list_nodes = root.findall(".//jobList") + root.findall(".//dJobList")
+        if list_nodes:
+            return ("✅", f"{name}: 정상")
+
+        return ("✅", f"{name}: 정상 (빈 결과)")
+    except Exception as e:
+        return ("❌", f"{name}: {str(e)[:50]}")
+
+
+def _check_openai_api(*, name: str = "OpenAI 임베딩") -> tuple:
+    """OpenAI 임베딩 API 헬스체크."""
+    api_key = (getattr(config, "OPENAI_API_KEY", "") or "").strip()
+    if not api_key:
+        return ("⚠️", f"{name}: 인증키 없음 (OPENAI_API_KEY)")
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        client.embeddings.create(
+            model=config.EMBEDDING_MODEL,
+            input=["test"],
+        )
+        return ("✅", f"{name}: 정상")
+    except Exception as e:
+        return ("❌", f"{name}: {str(e)[:50]}")
+
+
+def _check_claude_api(*, name: str = "Claude API") -> tuple:
+    """Anthropic Claude API 헬스체크 (ping 토큰 10개)."""
+    api_key = (getattr(config, "ANTHROPIC_API_KEY", "") or "").strip()
+    if not api_key:
+        return ("⚠️", f"{name}: 인증키 없음 (ANTHROPIC_API_KEY)")
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key)
+        client.messages.create(
+            model=config.CLAUDE_MODEL,
+            max_tokens=10,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return ("✅", f"{name}: 정상")
+    except Exception as e:
+        return ("❌", f"{name}: {str(e)[:50]}")
+
+
 # ── 사이드바 ──────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("# 🔗 JIB")
@@ -152,80 +271,48 @@ with st.sidebar:
     st.markdown("---")
     with st.expander("🔧 시스템 상태", expanded=False):
         if st.button("API 연동 확인", key="api_check"):
-            import requests
-            results = {}
-
-            # 1. 워크넷 직무데이터사전 API
-            try:
-                r = requests.get(
-                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo215L11.do",
-                    params={
-                        "authKey": config.WORKNET_API_KEY,
-                        "word": "데이터",
-                        "limit": 1,
-                        "returnType": "JSON",
-                    },
-                    timeout=5,
-                )
-                if r.status_code == 200 and len(r.text) > 50:
-                    results["워크넷 직무사전"] = "✅ 연동"
-                else:
-                    results["워크넷 직무사전"] = f"⚠️ {r.status_code}"
-            except Exception as e:
-                results["워크넷 직무사전"] = f"❌ {str(e)[:30]}"
-
-            # 2. 워크넷 직업정보 API
-            try:
-                r2 = requests.get(
-                    config.WORKNET_JOB_INFO,
-                    params={
-                        "authKey": config.WORKNET_API_KEY,
+            checks = [
+                _check_worknet_api(
+                    config.WORKNET_API_KEY,
+                    name="L11 직무데이터사전",
+                ),
+                _check_worknet_212_api(
+                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo212L01.do",
+                    "L01 직업정보 (212)",
+                    {
                         "returnType": "XML",
                         "target": "JOBCD",
-                        "keyword": "데이터",
+                        "srchType": "K",
+                        "keyword": "데이터분석가",
                     },
-                    timeout=5,
-                )
-                if r2.status_code == 200 and len(r2.text) > 50:
-                    results["워크넷 직업정보"] = "✅ 연동"
-                else:
-                    results["워크넷 직업정보"] = f"⚠️ {r2.status_code}"
-            except Exception as e:
-                results["워크넷 직업정보"] = f"❌ {str(e)[:30]}"
+                ),
+                _check_worknet_212_api(
+                    "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo212L50.do",
+                    "L50 직업사전 (212)",
+                    {
+                        "returnType": "XML",
+                        "target": "dJobCD",
+                        "srchType": "K",
+                        "keyword": "데이터분석",
+                        "startPage": 1,
+                        "display": 1,
+                    },
+                ),
+                _check_openai_api(),
+                _check_claude_api(),
+            ]
 
-            # 3. OpenAI 임베딩 API
-            try:
-                from openai import OpenAI
-                client_oai = OpenAI(api_key=config.OPENAI_API_KEY)
-                client_oai.embeddings.create(
-                    model=config.EMBEDDING_MODEL,
-                    input=["test"],
-                )
-                results["OpenAI 임베딩"] = "✅ 연동"
-            except Exception as e:
-                results["OpenAI 임베딩"] = f"❌ {str(e)[:30]}"
+            for emoji, msg in checks:
+                st.caption(f"{emoji} {msg}")
 
-            # 4. Claude API
-            try:
-                import anthropic
-                client_cl = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-                client_cl.messages.create(
-                    model=config.CLAUDE_MODEL,
-                    max_tokens=10,
-                    messages=[{"role": "user", "content": "ping"}],
-                )
-                results["Claude API"] = "✅ 연동"
-            except Exception as e:
-                results["Claude API"] = f"❌ {str(e)[:30]}"
+            # 핵심 API(L11 직무사전 + OpenAI + Claude) 상태로 종합 안내.
+            # 212번대 워크넷은 활용 신청 단계 차이로 미연동 케이스가 정상이므로
+            # 종합 판정에서는 제외한다.
+            l11_ok = checks[0][0] == "✅"
+            openai_ok = checks[-2][0] == "✅"
+            claude_ok = checks[-1][0] == "✅"
 
-            for name, status in results.items():
-                st.caption(f"{name}: {status}")
-
-            worknet_ok = results.get("워크넷 직무사전", "").startswith("✅")
-            claude_ok = results.get("Claude API", "").startswith("✅")
-            openai_ok = results.get("OpenAI 임베딩", "").startswith("✅")
-
-            if worknet_ok and claude_ok and openai_ok:
+            if l11_ok and claude_ok and openai_ok:
                 st.success("핵심 API 모두 정상 연동 중입니다.")
             elif claude_ok and openai_ok:
                 st.info("AI 핵심 기능은 정상입니다. 워크넷 일부 API는 파일 기반으로 동작합니다.")

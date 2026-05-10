@@ -429,9 +429,10 @@ def load_employment_trend() -> pd.DataFrame:
         pandas.DataFrame: ['직종중분류', '직종명', '평균구인배율']
     """
     out_cols = ["직종중분류", "직종명", "평균구인배율"]
-    file_path = _resolve_excel_path(config.RAW_DATA_DIR, "employment_trend")
+    # employment_trend 는 EIS 출처이므로 EIS_DATA_DIR 에서 탐지한다.
+    file_path = _resolve_excel_path(config.EIS_DATA_DIR, "employment_trend")
     if file_path is None:
-        _log_missing("employment_trend.xlsx/.xls")
+        _log_missing(f"{config.EIS_DATA_DIR}employment_trend.xlsx/.xls")
         return _empty_df(out_cols)
 
     try:
@@ -858,107 +859,288 @@ def load_job_wage_from_api() -> pd.DataFrame:
 # ──────────────────────────────────────────────────────────────────────────────
 # 기능 3-2) 임금통계: 고용노동통계포털 직종별 월임금총액 (KSCO 기준 CSV)
 # ──────────────────────────────────────────────────────────────────────────────
-# 한국표준직업분류(개정7차) 끝의 '(코드)' 추출용 정규식.
-_WAGE_KSCO_CODE_PAT = re.compile(r"\(([^)]+)\)\s*$")
-
-
 def load_wage_statistics() -> pd.DataFrame:
     """
-    [Phase1] 고용노동통계포털 직종별 임금 통계 로더.
+    [Phase1] 통합 임금 데이터 로더 (career + 5y fallback).
 
-    원본: 118_DT_118N_PAYM47_*.csv (laborstat.moel.go.kr 다운로드).
-    한국표준직업분류 개정7차 기준 직종별 월임금총액 (2020~2024년, 단위: 천원).
-    파일명을 'wage_statistics.csv' 로 저장한 뒤 사용한다.
+    1순위: wage_statistics_career.csv
+      - 경력구분=전경력, 성별=전체, 항목=월임금총액 → 평균 임금
+      - 경력구분=1~3년미만 → 신입 임금
+    2순위: wage_statistics_5y.csv (career에 없는 KSCO 코드 보완)
 
-    처리 흐름:
-        1) wage_statistics.csv 로드 (인코딩 자동 감지: chardet → cp949 → utf-8 fallback).
-        2) 필터 적용: 항목=='월임금총액' & 성별=='전체' & 경력구분=='전경력'.
-        3) 'YYYY 년' 패턴 컬럼 중 가장 최신 연도(예: '2024 년') 사용 → 월평균임금(천원).
-        4) '한국표준직업분류 개정7차' 컬럼 끝의 '(코드)' 를 분리해
-           직종코드_KSCO 와 직종명_KSCO(괄호 제거) 컬럼으로 분해.
-        5) 코드가 없는 '전직종' 같은 row 와 임금 NaN row 는 제외.
-
-    Returns:
-        pandas.DataFrame: ['직종코드_KSCO', '직종명_KSCO', '월평균임금_천원']
+    출력: 직종코드_KSCO, 직종명_KSCO, 월평균임금_천원, 신입임금_천원
     """
-    out_cols = ["직종코드_KSCO", "직종명_KSCO", "월평균임금_천원"]
-    file_path = Path(config.RAW_DATA_DIR) / "wage_statistics.csv"
+    import re
+    from pathlib import Path
+    import config
+
+    # ── 1단계: career 파일 로드 ──
+    career_path = Path(config.RAW_DATA_DIR) / "wage_statistics_career.csv"
+    main_df = pd.DataFrame()
+
+    if career_path.exists():
+        # chardet로 인코딩 직접 감지 (CP949 한국어 정확 인식)
+        df_raw = pd.DataFrame()
+        try:
+            import chardet
+            with open(career_path, 'rb') as f:
+                detected = chardet.detect(f.read(20000))
+                enc = detected.get('encoding') or 'cp949'
+
+            # 감지된 인코딩으로 시도, 실패 시 cp949 → utf-8-sig fallback
+            for try_enc in [enc, 'cp949', 'utf-8-sig']:
+                try:
+                    df_raw = pd.read_csv(career_path, encoding=try_enc)
+                    # 한글 컬럼이 정상 디코딩되었는지 검증
+                    if any('한국' in str(c) or '직업' in str(c) or '성별' in str(c)
+                           for c in df_raw.columns):
+                        print(f"  ↳ [career] 인코딩 '{try_enc}'로 로드 성공")
+                        break
+                    else:
+                        df_raw = pd.DataFrame()
+                except Exception:
+                    df_raw = pd.DataFrame()
+                    continue
+        except Exception as e:
+            print(f"⚠️ [career] 로드 실패: {e}")
+            df_raw = pd.DataFrame()
+
+        if not df_raw.empty:
+            df_raw.columns = df_raw.columns.str.strip()
+            print(f"✅ [career] 로드: {len(df_raw)}행, 컬럼: {df_raw.columns.tolist()[:6]}...")
+
+            required = ['한국표준직업분류 개정7차', '성별', '경력구분', '항목']
+            missing = [c for c in required if c not in df_raw.columns]
+
+            if missing:
+                print(f"⚠️ [career] 누락 컬럼: {missing}")
+            else:
+                main_df = df_raw[
+                    (df_raw['항목'].astype(str).str.strip() == '월임금총액') &
+                    (df_raw['성별'].astype(str).str.strip() == '전체')
+                ].copy()
+                print(f"  ↳ '월임금총액 & 성별=전체' 필터: {len(main_df)}행")
+
+    # ── 2단계: career 데이터 처리 (전경력 + 1~3년미만 분리) ──
+    result_main = pd.DataFrame()
+    if not main_df.empty:
+        # 연도 컬럼 찾기 (공백 허용: '2020 년', '2020년' 모두 매칭)
+        year_cols = [c for c in main_df.columns
+                     if re.search(r'(20\d{2})\s*년?$', str(c).strip())]
+        # '단위' 제외
+        year_cols = [c for c in year_cols if c != '단위']
+
+        if not year_cols:
+            print(f"⚠️ [career] 연도 컬럼 없음")
+        else:
+            latest_col = sorted(year_cols, key=lambda x: int(re.search(r'(20\d{2})', x).group(1)))[-1]
+            print(f"  ↳ 연도 컬럼 {len(year_cols)}개, 최신: '{latest_col}'")
+
+            # 임금 값 숫자 변환 (콤마 제거 후)
+            main_df['_임금'] = (
+                main_df[latest_col].astype(str)
+                .str.replace(',', '')
+                .str.replace(' ', '')
+                .replace(['', 'nan', '-', 'X'], pd.NA)
+            )
+            main_df['_임금'] = pd.to_numeric(main_df['_임금'], errors='coerce')
+            print(f"  ↳ 임금 변환 후 유효 행: {main_df['_임금'].notna().sum()}건")
+
+            # 직종코드 분리: '관리자(1)' → '1', '관리자'
+            def parse_jikjong(value):
+                s = str(value).strip()
+                m = re.search(r'\((\d+)\)$', s)
+                if m:
+                    return m.group(1), re.sub(r'\s*\(\d+\)$', '', s).strip()
+                return None, s
+
+            parsed = main_df['한국표준직업분류 개정7차'].apply(parse_jikjong)
+            main_df['직종코드_KSCO'] = [p[0] for p in parsed]
+            main_df['직종명_KSCO'] = [p[1] for p in parsed]
+
+            # 경력구분 정규화
+            main_df['_경력'] = main_df['경력구분'].astype(str).str.strip()
+
+            # 전경력 추출
+            전경력_df = main_df[main_df['_경력'] == '전경력'].copy()
+            전경력_df = 전경력_df[
+                전경력_df['직종코드_KSCO'].notna() &
+                전경력_df['_임금'].notna() &
+                (전경력_df['_임금'] > 0)
+            ][['직종코드_KSCO', '직종명_KSCO', '_임금']].copy()
+            전경력_df = 전경력_df.rename(columns={'_임금': '월평균임금_천원'})
+            print(f"  ↳ 전경력 추출: {len(전경력_df)}건")
+
+            # 1~3년미만 (신입) 추출
+            신입_df = main_df[main_df['_경력'] == '1~3년미만'].copy()
+            신입_df = 신입_df[
+                신입_df['직종코드_KSCO'].notna() &
+                신입_df['_임금'].notna() &
+                (신입_df['_임금'] > 0)
+            ][['직종코드_KSCO', '_임금']].copy()
+            신입_df = 신입_df.rename(columns={'_임금': '신입임금_천원'})
+            print(f"  ↳ 신입(1~3년미만) 추출: {len(신입_df)}건")
+
+            # 전경력 + 신입 left join
+            if not 전경력_df.empty:
+                result_main = 전경력_df.merge(
+                    신입_df, on='직종코드_KSCO', how='left'
+                )
+                result_main['월평균임금_천원'] = result_main['월평균임금_천원'].round(0).astype('Int64')
+                result_main['신입임금_천원'] = pd.to_numeric(
+                    result_main['신입임금_천원'], errors='coerce'
+                ).round(0).astype('Int64')
+                print(f"✅ career 데이터 통합: {len(result_main)}건 (기준: {latest_col})")
+
+    # ── 3단계: 5y 파일 fallback ──
+    fallback_path = Path(config.RAW_DATA_DIR) / "wage_statistics_5y.csv"
+    if fallback_path.exists():
+        fb_df = _safe_read_csv(str(fallback_path))
+        if not fb_df.empty:
+            fb_df.columns = fb_df.columns.str.strip()
+
+            if '고용형태' in fb_df.columns and '직종별' in fb_df.columns:
+                fb_df = fb_df[
+                    fb_df['고용형태'].astype(str).str.strip() == '전체근로자'
+                ].copy()
+
+                fb_year_cols = [c for c in fb_df.columns
+                                if str(c).split('.')[0].strip() in
+                                ['2020', '2021', '2022', '2023', '2024', '2025']]
+
+                if fb_year_cols and not fb_df.empty:
+                    for col in fb_year_cols:
+                        fb_df[col] = pd.to_numeric(
+                            fb_df[col].astype(str).str.replace(',', ''),
+                            errors='coerce'
+                        )
+                    fb_df['월평균임금_천원'] = fb_df[fb_year_cols].mean(axis=1, skipna=True)
+
+                    def parse_fb(value):
+                        s = str(value).strip()
+                        m = re.search(r'\((\d+)\)$', s)
+                        if m:
+                            return m.group(1), re.sub(r'\s*\(\d+\)$', '', s).strip()
+                        return None, s
+
+                    fb_parsed = fb_df['직종별'].apply(parse_fb)
+                    fb_df['직종코드_KSCO'] = [p[0] for p in fb_parsed]
+                    fb_df['직종명_KSCO'] = [p[1] for p in fb_parsed]
+
+                    fb_result = fb_df[
+                        fb_df['직종코드_KSCO'].notna() &
+                        fb_df['월평균임금_천원'].notna() &
+                        (fb_df['월평균임금_천원'] > 0)
+                    ][['직종코드_KSCO', '직종명_KSCO', '월평균임금_천원']].copy()
+                    fb_result['월평균임금_천원'] = fb_result['월평균임금_천원'].round(0).astype('Int64')
+                    fb_result['신입임금_천원'] = pd.NA
+                    fb_result['신입임금_천원'] = fb_result['신입임금_천원'].astype('Int64')
+
+                    print(f"✅ [5y fallback] 로드: {len(fb_result)}건 (5년 평균)")
+
+                    # career에 없는 KSCO 코드만 추가
+                    if not result_main.empty:
+                        existing_codes = set(result_main['직종코드_KSCO'].astype(str))
+                        fb_new = fb_result[
+                            ~fb_result['직종코드_KSCO'].astype(str).isin(existing_codes)
+                        ]
+                        if not fb_new.empty:
+                            print(f"  ↳ career에 없는 코드 추가: {len(fb_new)}건")
+                            result_main = pd.concat([result_main, fb_new], ignore_index=True)
+                    else:
+                        result_main = fb_result
+
+    if result_main.empty:
+        print(f"⚠️ 임금 데이터 로드 실패 — 빈 DataFrame")
+        return pd.DataFrame()
+
+    result_main = result_main.reset_index(drop=True)
+    print(f"✅ [통합 임금 데이터] 최종 {len(result_main)}건")
+    print(result_main.head(10).to_string(index=False))
+
+    return result_main
+
+
+def load_wage_by_job() -> pd.DataFrame:
+    """[Phase1] 직업별 분위 임금 정보 로더 (한국고용정보원 직업별_임금정보).
+
+    파일: data/raw/wage_by_job.csv
+        - 의·법 전문직 10여 개 직업의 상위25% / 중위 / 하위25% 분위 임금
+        - 단위: 천원/월
+        - 인코딩: UTF-8 (utf-8-sig / cp949 폴백)
+
+    출력 컬럼:
+        - 직업명_임금기준 (str) : 매칭용 원본 직업명
+        - 상위25_임금_천원 (Int64)
+        - 중위_임금_천원 (Int64)
+        - 하위25_임금_천원 (Int64)
+
+    파일이 없으면 빈 DataFrame 을 반환한다(빌드 흐름은 안전하게 폴백).
+    """
+    file_path = Path(config.RAW_DATA_DIR) / "wage_by_job.csv"
     if not file_path.exists():
-        _log_missing("wage_statistics.csv")
-        return _empty_df(out_cols)
+        return pd.DataFrame()
 
-    df = _safe_read_csv(file_path)
-    if df.empty:
-        return _empty_df(out_cols)
+    # ── 인코딩 폴백 (utf-8 → utf-8-sig → cp949) ──────────────────────
+    try:
+        df = pd.read_csv(file_path, encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(file_path, encoding="utf-8-sig")
+        except Exception:
+            try:
+                df = pd.read_csv(file_path, encoding="cp949")
+            except Exception as e:
+                print(f"⚠️ [wage_by_job.csv] 로드 실패: {e}")
+                return pd.DataFrame()
 
-    cls_col = _pick_column(
-        df, "한국표준직업분류 개정7차", ["한국표준직업분류", "직업분류", "직종"]
-    )
-    item_col = _pick_column(df, "항목", ["항목"])
-    sex_col = _pick_column(df, "성별", ["성별"])
-    career_col = _pick_column(df, "경력구분", ["경력"])
-    if not (cls_col and item_col and sex_col and career_col):
-        print(
-            f"⚠️ [{file_path.name}] 핵심 컬럼 누락 "
-            f"(분류={cls_col}, 항목={item_col}, 성별={sex_col}, 경력={career_col}) — 빈 DataFrame 반환"
-        )
-        return _empty_df(out_cols)
+    if df.empty or "직업명" not in df.columns:
+        return pd.DataFrame()
 
-    flt = df[
-        (df[item_col].astype(str).str.strip() == "월임금총액")
-        & (df[sex_col].astype(str).str.strip() == "전체")
-        & (df[career_col].astype(str).str.strip() == "전경력")
-    ].copy()
-    if flt.empty:
-        print(f"⚠️ [{file_path.name}] 필터 조건에 해당하는 행이 없음 — 빈 DataFrame 반환")
-        return _empty_df(out_cols)
+    # ── 컬럼명 정규화 (괄호·퍼센트 포함 → 깔끔한 이름) ──────────────
+    rename_map: Dict[str, str] = {}
+    for col in df.columns:
+        col_clean = str(col).strip()
+        if "상위" in col_clean and "25" in col_clean:
+            rename_map[col] = "상위25_임금_천원"
+        elif "중위" in col_clean:
+            rename_map[col] = "중위_임금_천원"
+        elif "하위" in col_clean and "25" in col_clean:
+            rename_map[col] = "하위25_임금_천원"
+        elif col_clean == "직업명":
+            rename_map[col] = "직업명_임금기준"
+    df = df.rename(columns=rename_map)
 
-    year_pat = re.compile(r"^(\d{4})\s*년\s*$")
-    year_cols: List[tuple] = []
-    for c in flt.columns:
-        m = year_pat.match(str(c).strip())
-        if m:
-            year_cols.append((int(m.group(1)), c))
-    if not year_cols:
-        print(f"⚠️ [{file_path.name}] 'YYYY 년' 컬럼을 찾지 못함 — 빈 DataFrame 반환")
-        return _empty_df(out_cols)
-    year_cols.sort(key=lambda t: t[0])
-    latest_year, latest_col = year_cols[-1]
+    # ── 직업명 trailing space 제거 ───────────────────────────────────
+    if "직업명_임금기준" in df.columns:
+        df["직업명_임금기준"] = df["직업명_임금기준"].astype(str).str.strip()
 
-    cls_series = flt[cls_col].astype(str).str.strip()
+    # ── 임금 컬럼 trailing space + 콤마 제거 + 숫자 변환 ────────────
+    wage_cols = ["상위25_임금_천원", "중위_임금_천원", "하위25_임금_천원"]
+    for col in wage_cols:
+        if col in df.columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.replace(",", "", regex=False)
+            )
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    def _extract_code_name(s: str) -> tuple:
-        m = _WAGE_KSCO_CODE_PAT.search(s)
-        if m:
-            code = m.group(1).strip()
-            name = _WAGE_KSCO_CODE_PAT.sub("", s).strip()
-            return code, name
-        return "", s
+    # ── 유효 행 필터 + 정수 변환 ─────────────────────────────────────
+    needed_cols = [
+        c for c in ["직업명_임금기준", *wage_cols] if c in df.columns
+    ]
+    df = df[needed_cols].dropna(subset=["직업명_임금기준"]).copy()
 
-    parsed = cls_series.apply(_extract_code_name)
-    flt["_직종코드_KSCO"] = parsed.apply(lambda t: t[0])
-    flt["_직종명_KSCO"] = parsed.apply(lambda t: t[1])
-    flt["_월평균임금_천원"] = pd.to_numeric(flt[latest_col], errors="coerce")
+    for col in wage_cols:
+        if col in df.columns:
+            df[col] = df[col].round(0).astype("Int64")
 
-    result = flt[flt["_직종코드_KSCO"] != ""].rename(
-        columns={
-            "_직종코드_KSCO": "직종코드_KSCO",
-            "_직종명_KSCO": "직종명_KSCO",
-            "_월평균임금_천원": "월평균임금_천원",
-        }
-    )[out_cols].copy()
-    result = (
-        result.dropna(subset=["월평균임금_천원"])
-        .drop_duplicates(subset=["직종코드_KSCO"], keep="first")
-        .reset_index(drop=True)
-    )
-    result["월평균임금_천원"] = result["월평균임금_천원"].astype(float).round(0).astype(int)
+    df = df[df["직업명_임금기준"].astype(str).str.strip() != ""].reset_index(drop=True)
 
-    print(
-        f"✅ [{file_path.name}] 임금통계 로드 완료: {len(result)}건 "
-        f"(기준 연도: {latest_year}년, 단위: 천원)"
-    )
-    return result
+    print(f"✅ [wage_by_job.csv] 직업별 분위 임금 로드: {len(df)}건")
+    return df
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1290,6 +1472,153 @@ def _aggregate_education_major_to_top_category(em_df: pd.DataFrame) -> pd.DataFr
     return out.reset_index(drop=True)
 
 
+def load_education_distribution() -> pd.DataFrame:
+    """[Phase1] 직업별 학력 분포 로더.
+
+    job_education_major.csv 의 학력 wide 컬럼(중졸이하 ~ 박사졸)을 비율화해
+    상담·매칭에 바로 쓸 수 있는 파생 컬럼을 산출한다. '직업교육' 컬럼은 전체
+    결측이라 제외하며, 응답자 합계가 0인 행은 산출 대상에서 빠진다.
+
+    Returns:
+        pandas.DataFrame: 다음 컬럼을 갖는 학력 분포 파생 데이터.
+            - 직업코드 (str)              : KNOW직업코드 → master 와 동일 키 도메인
+            - 주요학력수준 (str)          : argmax 학력 라벨 (예: '대졸')
+            - 학력_고졸이하비율 (float)   : 중졸이하 + 고졸 합산 비율 (0~1, 소수 3자리)
+            - 학력_전문대졸비율 (float)   : 전문대졸 비율 (0~1, 소수 3자리)
+            - 학력_대졸이상비율 (float)   : 대졸 + 대학원졸 + 박사졸 합산 비율 (0~1)
+            - 학력점수 (float, 0~6)       : 가중평균 학력 수준 (소수 2자리)
+
+    학력점수 환산 가중치:
+        중졸이하=0, 고졸=2, 전문대졸=3, 대졸=4, 대학원졸=5, 박사졸=6.
+
+    파일이 없거나 학력 컬럼이 하나도 없으면 빈 DataFrame 을 반환한다.
+    """
+    file_path = Path(config.JOB_EDUCATION_MAJOR_FILE)
+    if not file_path.exists():
+        return pd.DataFrame()
+
+    # ── 인코딩 자동 감지 (chardet → cp949 → utf-8-sig 폴백) ──────────
+    df = pd.DataFrame()
+    try:
+        try:
+            import chardet  # type: ignore[import-not-found]
+        except ImportError:
+            chardet = None  # type: ignore[assignment]
+
+        enc_first = "cp949"
+        if chardet is not None:
+            with open(file_path, "rb") as f:
+                detected = chardet.detect(f.read(20000))
+            enc_first = detected.get("encoding") or "cp949"
+
+        for try_enc in [enc_first, "cp949", "utf-8-sig"]:
+            try:
+                df = pd.read_csv(file_path, encoding=try_enc)
+                # 한글 컬럼이 정상 디코딩됐는지 검증 — mojibake 케이스 차단
+                if any("학력" in str(c) for c in df.columns):
+                    break
+                df = pd.DataFrame()
+            except Exception:
+                df = pd.DataFrame()
+                continue
+    except Exception as e:
+        print(f"⚠️ [education_distribution] 로드 실패: {e}")
+        return pd.DataFrame()
+
+    if df.empty or "KNOW직업코드" not in df.columns:
+        return pd.DataFrame()
+
+    # ── 학력 컬럼 정의 (전체 결측인 '직업교육'은 제외) ──────────────
+    edu_cols_active = [
+        "학력-중졸이하",
+        "학력-고졸",
+        "학력-전문대졸",
+        "학력-대졸",
+        "학력-대학원졸",
+        "학력-박사졸",
+    ]
+    edu_cols_active = [c for c in edu_cols_active if c in df.columns]
+    if not edu_cols_active:
+        return pd.DataFrame()
+
+    # 숫자 변환 + 결측 0 처리
+    for c in edu_cols_active:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # 응답자 합계 (분모). 0인 행은 비율 산출 불가 → 제외.
+    df["_총응답수"] = df[edu_cols_active].sum(axis=1)
+    valid = df[df["_총응답수"] > 0].copy()
+    if valid.empty:
+        return pd.DataFrame()
+
+    # 비율 환산 (0~1)
+    for c in edu_cols_active:
+        valid[c + "_비율"] = valid[c] / valid["_총응답수"]
+
+    # 1) 주요학력수준 ← argmax 라벨 매핑
+    label_map = {
+        "학력-중졸이하": "중졸이하",
+        "학력-고졸": "고졸",
+        "학력-전문대졸": "전문대졸",
+        "학력-대졸": "대졸",
+        "학력-대학원졸": "대학원졸",
+        "학력-박사졸": "박사졸",
+    }
+    valid["주요학력수준"] = valid[edu_cols_active].idxmax(axis=1).map(label_map)
+
+    # 2) 학력군별 합산 비율
+    valid["학력_고졸이하비율"] = (
+        valid.get("학력-중졸이하_비율", 0)
+        + valid.get("학력-고졸_비율", 0)
+    )
+    valid["학력_전문대졸비율"] = valid.get("학력-전문대졸_비율", 0)
+    valid["학력_대졸이상비율"] = (
+        valid.get("학력-대졸_비율", 0)
+        + valid.get("학력-대학원졸_비율", 0)
+        + valid.get("학력-박사졸_비율", 0)
+    )
+
+    # 3) 학력점수 (가중평균, 0~6 스케일)
+    score_weights = {
+        "학력-중졸이하": 0,
+        "학력-고졸": 2,
+        "학력-전문대졸": 3,
+        "학력-대졸": 4,
+        "학력-대학원졸": 5,
+        "학력-박사졸": 6,
+    }
+    valid["학력점수"] = sum(
+        valid[c + "_비율"] * w
+        for c, w in score_weights.items()
+        if c in edu_cols_active
+    )
+
+    # ── 출력 정리 ─────────────────────────────────────────────────
+    # 코드 도메인은 base/master 와 동일하게 '직업코드' 로 정렬한다
+    # (원본 컬럼명 'KNOW직업코드' → 일괄 rename).
+    result = valid.rename(columns={"KNOW직업코드": "직업코드"})[[
+        "직업코드",
+        "주요학력수준",
+        "학력_고졸이하비율",
+        "학력_전문대졸비율",
+        "학력_대졸이상비율",
+        "학력점수",
+    ]].copy()
+
+    result["직업코드"] = result["직업코드"].astype(str).str.strip()
+    result["학력점수"] = result["학력점수"].round(2)
+    for c in ("학력_고졸이하비율", "학력_전문대졸비율", "학력_대졸이상비율"):
+        result[c] = result[c].round(3)
+
+    result = result.drop_duplicates(subset=["직업코드"]).reset_index(drop=True)
+
+    print(f"✅ [education_distribution] 학력 분포 파생: {len(result)}행")
+    print("   주요학력수준 분포:")
+    print(result["주요학력수준"].value_counts().to_string())
+
+    return result
+
+
 def _normalize_prospect_base(prospect_df: pd.DataFrame) -> Optional[pd.DataFrame]:
     """prospect DataFrame을 master 베이스 표준 형태로 정규화한다.
 
@@ -1402,6 +1731,30 @@ def build_master_job_data() -> pd.DataFrame:
             base = base.merge(em_top, on="직업코드", how="left")
     if "주요전공계열" not in base.columns:
         base["주요전공계열"] = pd.NA
+
+    # ── 2-b) 학력 분포 파생 컬럼 ← education_major 학력 wide ───────
+    # 같은 원본(job_education_major.csv) 의 학력 컬럼군을 비율화해
+    # 주요학력수준 / 학력군별 비율 / 학력점수(0~6) 5종을 master 에 합친다.
+    edu_dist = load_education_distribution()
+    if not edu_dist.empty and "직업코드" in base.columns:
+        edu_dist["직업코드"] = edu_dist["직업코드"].astype(str)
+        base["직업코드"] = base["직업코드"].astype(str)
+        base = base.merge(edu_dist, on="직업코드", how="left")
+        if "주요학력수준" in base.columns:
+            print(
+                "✅ 학력 파생 컬럼 병합: "
+                f"주요학력수준={base['주요학력수준'].notna().sum()}건"
+            )
+    # 합쳐지지 않았더라도 final_cols 슬롯이 비어 있도록 NA 보장.
+    for col in (
+        "주요학력수준",
+        "학력_고졸이하비율",
+        "학력_전문대졸비율",
+        "학력_대졸이상비율",
+        "학력점수",
+    ):
+        if col not in base.columns:
+            base[col] = pd.NA
 
     # ── 3) 유사직업명_합산 ← similar_names 보강 (2단계 매칭) ──────────
     #
@@ -1866,6 +2219,7 @@ def build_master_job_data() -> pd.DataFrame:
     #     print(f"✅ 임금통계 병합 완료: {ws_matched}건 매칭")
 
     base["월평균임금_천원"] = pd.NA
+    base["신입임금_천원"] = pd.NA
     ws_df = load_wage_statistics()
     know_to_ksco: Dict[str, List[str]] = getattr(
         config, "KNOW_TO_KSCO_KEYWORDS", {}
@@ -1874,44 +2228,61 @@ def build_master_job_data() -> pd.DataFrame:
     if not ws_df.empty and know_to_ksco:
         ws_names = ws_df["직종명_KSCO"].astype(str).fillna("")
 
-        # 단계 2: KNOW직종별 평균 임금 선계산
+        # 단계 2: KNOW직종별 평균 임금 + 신입 임금 선계산
         know_avg_wage: Dict[str, float] = {}
+        know_entry_wage: Dict[str, float] = {}
         know_match_count: Dict[str, int] = {}
         for know_key, ksco_keywords in know_to_ksco.items():
             if not ksco_keywords:
                 continue
             kws = list(ksco_keywords)
             mask = ws_names.apply(
-                lambda x, kws=kws: any(kw in x for kw in kws)
+                lambda x, kws=kws: any(kw in str(x) for kw in kws)
             )
-            matched_wages = ws_df.loc[mask, "월평균임금_천원"]
-            if matched_wages.empty:
+            matched = ws_df.loc[mask]
+            if matched.empty:
                 continue
-            avg = float(pd.to_numeric(matched_wages, errors="coerce").mean())
-            if pd.notna(avg):
-                know_avg_wage[know_key] = avg
-                know_match_count[know_key] = int(matched_wages.shape[0])
+
+            wages = pd.to_numeric(
+                matched["월평균임금_천원"], errors="coerce"
+            ).dropna()
+            if len(wages) > 0:
+                know_avg_wage[know_key] = round(float(wages.mean()))
+                know_match_count[know_key] = int(matched.shape[0])
+
+            # 신입임금 컬럼이 있으면 추출
+            if "신입임금_천원" in matched.columns:
+                entry_wages = pd.to_numeric(
+                    matched["신입임금_천원"], errors="coerce"
+                ).dropna()
+                if len(entry_wages) > 0:
+                    know_entry_wage[know_key] = round(float(entry_wages.mean()))
 
         # 단계 3: master 행에 매핑 (가장 긴 KNOW 키 우선 = 구체성 우선)
         sorted_keys = sorted(know_avg_wage.keys(), key=len, reverse=True)
+        for idx, row in base.iterrows():
+            대분류 = str(row.get("대분류명", ""))
+            중분류 = str(row.get("중분류명", ""))
+            if 대분류 in ("nan", "None"):
+                대분류 = ""
+            if 중분류 in ("nan", "None"):
+                중분류 = ""
+            if not 대분류 and not 중분류:
+                continue
 
-        def _resolve_wage(row: pd.Series) -> object:
-            mid = row.get("중분류명")
-            top = row.get("대분류명")
-            mid_s = str(mid) if pd.notna(mid) else ""
-            top_s = str(top) if pd.notna(top) else ""
-            if not mid_s and not top_s:
-                return pd.NA
             for know_key in sorted_keys:
-                if know_key in mid_s or know_key in top_s:
-                    return int(round(know_avg_wage[know_key]))
-            return pd.NA
+                if know_key in 대분류 or know_key in 중분류:
+                    base.at[idx, "월평균임금_천원"] = know_avg_wage[know_key]
+                    if know_key in know_entry_wage:
+                        base.at[idx, "신입임금_천원"] = know_entry_wage[know_key]
+                    break
 
-        base["월평균임금_천원"] = base.apply(_resolve_wage, axis=1)
         ws_matched = int(base["월평균임금_천원"].notna().sum())
+        ws_entry_matched = int(base["신입임금_천원"].notna().sum())
         print(
             f"✅ KNOW↔KSCO 임금 매핑 완료: {ws_matched}건 "
-            f"(전체 {len(base)}건 중 {ws_matched}건 매칭)"
+            f"(전체 {len(base)}건 중 {ws_matched}건 매칭, "
+            f"신입 임금 {ws_entry_matched}건)"
         )
 
         # 디버그: 매핑된 KNOW직종별 평균임금 상위 10개
@@ -1922,12 +2293,65 @@ def build_master_job_data() -> pd.DataFrame:
             print("📊 KNOW직종별 평균임금 상위 10개 (KSCO 키워드 매칭 기반):")
             for know_key, avg in top10:
                 n_ksco = know_match_count.get(know_key, 0)
+                entry_str = (
+                    f"신입 {know_entry_wage[know_key]:>7,.0f}천원"
+                    if know_key in know_entry_wage
+                    else "신입 -"
+                )
                 print(
                     f"   - {know_key:<35s} "
-                    f"{avg:>8,.0f}천원  (KSCO {n_ksco}개 평균)"
+                    f"{avg:>8,.0f}천원  (KSCO {n_ksco}개 평균, {entry_str})"
                 )
     elif not ws_df.empty:
         print("⚠️ config.KNOW_TO_KSCO_KEYWORDS 가 비어 있어 임금통계 매핑 생략")
+
+    # ── 7-3) wage_by_job.csv 분위 임금 통합 (10개 직업 직접 매칭) ───────
+    # 한국고용정보원 직업별_임금정보 (의·법 전문직 10여 개) 의 분위(상위25/중위/하위25)
+    # 임금을 직업명 substring 매칭으로 KNOW 마스터에 주입.
+    base["상위25_임금_천원"] = pd.NA
+    base["중위_임금_천원"] = pd.NA
+    base["하위25_임금_천원"] = pd.NA
+    wage_by_job_df = load_wage_by_job()
+    if not wage_by_job_df.empty:
+        master_total = len(base)
+        matched_count = 0
+        wage_records = wage_by_job_df.to_dict("records")
+
+        for idx, row in base.iterrows():
+            know_job_name = str(row.get("직업명", "")).strip()
+            if not know_job_name:
+                continue
+
+            for w_row in wage_records:
+                wage_job_name = str(w_row.get("직업명_임금기준", "")).strip()
+                if not wage_job_name:
+                    continue
+                # 양방향 substring 매칭: KNOW에 wage 직업명 포함 또는 그 반대
+                if wage_job_name in know_job_name or know_job_name in wage_job_name:
+                    base.at[idx, "상위25_임금_천원"] = w_row.get("상위25_임금_천원")
+                    base.at[idx, "중위_임금_천원"] = w_row.get("중위_임금_천원")
+                    base.at[idx, "하위25_임금_천원"] = w_row.get("하위25_임금_천원")
+                    matched_count += 1
+                    break
+
+        # Int64 다운캐스트 (NA 보존)
+        for col in ["상위25_임금_천원", "중위_임금_천원", "하위25_임금_천원"]:
+            base[col] = pd.to_numeric(base[col], errors="coerce").astype("Int64")
+
+        print(
+            f"✅ [wage_by_job] 분위 임금 매칭: {matched_count}건 / {master_total}건"
+        )
+        matched_preview = base[base["중위_임금_천원"].notna()].head(5)
+        if not matched_preview.empty:
+            print("   → 매칭 직업 샘플:")
+            for _, m_row in matched_preview.iterrows():
+                상위 = m_row.get("상위25_임금_천원")
+                중위 = m_row.get("중위_임금_천원")
+                하위 = m_row.get("하위25_임금_천원")
+                print(
+                    f"     {m_row.get('직업명', '-')}: "
+                    f"상위 {상위}천원 / 중위 {중위}천원 / 하위 {하위}천원"
+                )
 
     # ── 8) 전공별 진출직업 (진출순위 1위만, 진출직업명↔직업명) ─────────
     # 사용자 데이터에 진출순위/진출비율이 없을 수 있으므로 옵셔널 처리:
@@ -2003,9 +2427,13 @@ def build_master_job_data() -> pd.DataFrame:
     final_cols = [
         "직업코드", "직업명",
         "직업전망_텍스트", "전망점수",
-        "주요전공계열", "유사직업명_합산", "대분류명", "중분류명",
+        "주요전공계열",
+        "주요학력수준", "학력_고졸이하비율", "학력_전문대졸비율",
+        "학력_대졸이상비율", "학력점수",
+        "유사직업명_합산", "대분류명", "중분류명",
         "평균구인배율", "평균부족률",
-        "중위임금", "하위임금", "월평균임금_천원",
+        "중위임금", "하위임금", "월평균임금_천원", "신입임금_천원",
+        "상위25_임금_천원", "중위_임금_천원", "하위25_임금_천원",
         "졸업전취업률", "3개월이내취업률",
         "전직가능직무명",
     ]
@@ -2035,6 +2463,12 @@ def build_master_job_data() -> pd.DataFrame:
             pct = filled / total * 100 if total else 0.0
             status = "✅" if pct > 30 else "⚠️"
             print(f"  {status} {col}: {filled}/{total} ({pct:.1f}%)")
+
+    if "중위_임금_천원" in master.columns:
+        fill = int(master["중위_임금_천원"].notna().sum())
+        pct = fill / total * 100 if total else 0.0
+        icon = "✅" if fill > 0 else "⚠️"
+        print(f"  {icon} 분위 임금: {fill}/{total} ({pct:.1f}%)")
 
     no_rate = master[
         master["평균구인배율"].isna()
@@ -2215,6 +2649,7 @@ def build_master_with_eis(
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("[JIB] data_loader 단독 실행")
+
     print("─" * 70)
     print("STEP 0) 임금정보 API 응답 점검 (check_wage_api_response)")
     check_wage_api_response()

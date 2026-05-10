@@ -12,7 +12,20 @@ __pycache__/
 *.pyd
 
 # 원본 데이터 (용량 크고 재배포 불필요)
-data/raw/
+data/raw/*
+# 단, 빌드/매칭에 필수인 KNOW·고용노동·지표 CSV는 예외로 추적
+!data/raw/job_prospect.csv
+!data/raw/job_education_major.csv
+!data/raw/job_similar_names.csv
+!data/raw/job_subclass.csv
+!data/raw/job_midclass.csv
+!data/raw/labor_shortage.csv
+!data/raw/wage_statistics_career.csv
+!data/raw/wage_statistics_5y.csv
+!data/raw/wage_by_job.csv
+!data/raw/ncs_career_path.csv
+!data/raw/top_jobs_by_major.csv
+!data/raw/first_job_entry.csv
 
 # IDE
 .vscode/
@@ -25,6 +38,9 @@ Thumbs.db
 
 # 로그
 *.log
+
+# 임시 진단 스크립트 (워크넷 API/지표 점검용 일회성 도구)
+_diag_*.py
 
 # 아래는 GitHub에 포함 (배포에 필요)
 # embeddings/job_embeddings.csv → 포함

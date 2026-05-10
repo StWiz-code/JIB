@@ -283,6 +283,123 @@ def _fetch_ncs_from_worknet(
     return df[list(std_cols)].copy()
 
 
+def _fetch_std_job_desc_from_worknet(
+    keyword: str,
+    *,
+    limit: int = 5,
+    timeout: float = 8.0,
+) -> pd.DataFrame:
+    """
+    워크넷 표준직무기술서 API (L12) 호출.
+
+    L11(직무사전 NCS) 보다 직무기술서·직무정의 등 풍부한 텍스트를 제공해
+    RAG 코퍼스 보강에 유용하다.
+
+    Args:
+        keyword: 검색 키워드 (예: '데이터분석', '디자인').
+        limit:   최대 반환 행 수.
+        timeout: HTTP 타임아웃(초).
+
+    Returns:
+        pandas.DataFrame: ['NCS대분류명','NCS중분류명','NCS소분류명',
+                           'NCS세분류명','직무명','직무정의','직무기술서',
+                           '_api_source']
+        인증키 누락·네트워크 오류·빈 응답 시 빈 DataFrame 을 돌려준다.
+    """
+    api_key = (getattr(config, "WORKNET_API_KEY", "") or "").strip()
+    url = getattr(config, "WORKNET_STD_JOB", "") or ""
+    if not api_key or not url:
+        return pd.DataFrame()
+    if not keyword or not keyword.strip():
+        return pd.DataFrame()
+
+    try:
+        import requests  # 무거운 의존성이라 호출 시점에만 임포트한다.
+    except ImportError:
+        return pd.DataFrame()
+
+    kw = keyword.strip()
+    try:
+        resp = requests.get(
+            url,
+            params={
+                "authKey": api_key,
+                "callTp": "L",
+                "returnType": "JSON",
+                "startPage": 1,
+                "display": max(1, int(limit)),
+                # work24 서버 버전에 따라 파라미터명 차이 → 셋 다 전송.
+                "srchKwd": kw,
+                "keyword": kw,
+                "searchKeyword": kw,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"    ⚠️ '{kw}' L12 호출 실패: {e}")
+        return pd.DataFrame()
+
+    # ── 응답 파싱 (JSON 우선, XML 폴백) ──
+    # L12 는 직무정의/직무기술서 등 _WORKNET_KEY_MAP 에 없는 필드를 포함하므로
+    # 공유 헬퍼(_parse_worknet_response) 대신 직접 파싱한다.
+    items: List[dict] = []
+    text = (resp.text or "").strip()
+    if not text:
+        return pd.DataFrame()
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            for key in ("items", "item", "result", "list", "data", "rows"):
+                payload = data.get(key)
+                if isinstance(payload, list):
+                    items = [it for it in payload if isinstance(it, dict)]
+                    break
+                if isinstance(payload, dict):
+                    items = [payload]
+                    break
+        elif isinstance(data, list):
+            items = [it for it in data if isinstance(it, dict)]
+    except (json.JSONDecodeError, ValueError):
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(text)
+            for elem in root.iter():
+                if elem.tag.lower() in ("item", "row", "vo"):
+                    items.append({child.tag: (child.text or "") for child in elem})
+        except Exception:
+            return pd.DataFrame()
+
+    if not items:
+        return pd.DataFrame()
+
+    def _pick(item: dict, *keys: str) -> str:
+        for k in keys:
+            v = item.get(k)
+            if v not in (None, "", "null"):
+                return str(v).strip()
+        return ""
+
+    records: List[dict] = []
+    for item in items[: max(1, int(limit))]:
+        records.append({
+            "NCS대분류명": _pick(item, "lcfNm", "lcfn", "ncsLclasNm", "대분류명"),
+            "NCS중분류명": _pick(item, "mcfNm", "mcn", "ncsMclasNm", "중분류명"),
+            "NCS소분류명": _pick(item, "scfNm", "scfn", "ncsSclasNm", "소분류명"),
+            "NCS세분류명": _pick(item, "subClsfNm", "sclsfn", "세분류명"),
+            "직무명":     _pick(item, "jobNm", "job_sdvn", "ncsJobNm", "직무명"),
+            "직무정의":   _pick(item, "jobDef", "job_def", "직무정의"),
+            "직무기술서": _pick(item, "jobDesc", "job_desc", "직무기술서")[:500],
+            "_api_source": "L12_표준직무기술서",
+        })
+
+    df = pd.DataFrame(records)
+    # 직무명 비어 있는 행 제거 (의미 없는 결과 제외).
+    df = df[df["직무명"].astype(str).str.strip() != ""]
+    return df.reset_index(drop=True)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 기능 1) 파일 기반 코퍼스 구성
 # ──────────────────────────────────────────────────────────────────────────────
@@ -308,7 +425,13 @@ def build_corpus_from_files() -> pd.DataFrame:
         "직업코드", "직업명", "대분류명", "중분류명",
         "직업전망_텍스트", "전망점수", "주요전공계열",
         "유사직업명_합산", "전직가능직무명",
-        "월평균임금_천원", "평균구인배율",
+        "월평균임금_천원", "신입임금_천원",
+        # 분위 임금 (load_wage_by_job 산출, UI 분포 표시용)
+        "상위25_임금_천원", "중위_임금_천원", "하위25_임금_천원",
+        "평균구인배율", "평균부족률",
+        # 학력 분포 파생 (load_education_distribution 산출, 매칭/UI 활용)
+        "주요학력수준", "학력_고졸이하비율", "학력_전문대졸비율",
+        "학력_대졸이상비율", "학력점수",
     ]
     available = [c for c in desired_master_cols if c in master.columns]
     missing = [c for c in desired_master_cols if c not in master.columns]
@@ -467,8 +590,41 @@ def build_corpus_from_files() -> pd.DataFrame:
             print(f"    ✅ '{kw}': {len(api_df)}건 수집")
             master = pd.concat([master, api_df], ignore_index=True, sort=False)
 
+        l11_added = len(master) - original_len
+        print(f"  ☁️ L11 NCS 직무사전 보강 완료: +{l11_added}행")
+
+        # ── L12: 표준직무기술서 (직무정의/직무기술서 풍부한 텍스트) ─────
+        l12_added = 0
+        for kw in api_keywords:
+            api_df = _fetch_std_job_desc_from_worknet(kw, limit=5)
+            if api_df.empty:
+                continue
+
+            api_df["embed_text"] = api_df.apply(
+                lambda r: " ".join(
+                    s for s in (
+                        str(r.get("직무명", "")).strip(),
+                        str(r.get("직무정의", "")).strip(),
+                        str(r.get("직무기술서", "")).strip()[:300],
+                        str(r.get("NCS대분류명", "")).strip(),
+                        str(r.get("NCS중분류명", "")).strip(),
+                    ) if s and s.lower() not in ("nan", "none")
+                ).strip(),
+                axis=1,
+            )
+            api_df = api_df[api_df["embed_text"].str.len() > 10]
+            if api_df.empty:
+                continue
+
+            print(f"    ✅ '{kw}' (L12): {len(api_df)}건 수집")
+            master = pd.concat([master, api_df], ignore_index=True, sort=False)
+            l12_added += len(api_df)
+
+        if l12_added > 0:
+            print(f"  ☁️ L12 표준직무기술서 보강: +{l12_added}행")
+
         api_added = len(master) - original_len
-        print(f"  ☁️ 워크넷 API 보강 완료: +{api_added}행 추가")
+        print(f"  ☁️ 워크넷 API 보강 합계: +{api_added}행 추가")
     else:
         print("  💻 로컬 환경 — API 보강 생략 (파일 기반 코퍼스 그대로 사용)")
 

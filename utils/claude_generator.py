@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json  # noqa: F401  (외부에서 사용할 수 있도록 노출)
 import sys as _sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -161,6 +162,164 @@ def _safe_create_message(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 워크넷 OpenAPI 보강 (212L01 직업정보 / 212L50 직업사전)
+#   TOP-3 직업명 키워드로 워크넷에 실시간 질의해 공식 분류명·관련 세세분류 직업
+#   리스트를 가져와 Claude 프롬프트의 jobs_summary 에 덧붙인다.
+#   응답 포맷이 XML 이므로 xml.etree.ElementTree 로 파싱한다.
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_related_jobs_from_worknet(
+    job_name: str,
+    *,
+    limit: int = 5,
+    timeout: float = 5.0,
+) -> List[Dict[str, str]]:
+    """
+    워크넷 직업정보 API (212L01) 호출.
+    직업명 키워드로 매칭되는 직업 리스트를 반환한다.
+
+    Returns:
+        list[dict]: [{"jobCd": "K000001080",
+                      "jobNm": "데이터분석가",
+                      "jobClcdNM": "데이터·네트워크 전문가"}, ...]
+    """
+    import requests
+
+    api_key = (getattr(config, "WORKNET_API_KEY_JOB", "") or "").strip()
+    if not api_key or not job_name:
+        return []
+
+    try:
+        url = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo212L01.do"
+        params = {
+            "authKey": api_key,
+            "returnType": "XML",
+            "target": "JOBCD",
+            "srchType": "K",
+            "keyword": str(job_name).strip(),
+        }
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            return []
+
+        root = ET.fromstring(r.text)
+        results: List[Dict[str, str]] = []
+        for job_node in root.findall(".//jobList"):
+            results.append({
+                "jobCd": (job_node.findtext("jobCd") or "").strip(),
+                "jobNm": (job_node.findtext("jobNm") or "").strip(),
+                "jobClcdNM": (job_node.findtext("jobClcdNM") or "").strip(),
+            })
+            if len(results) >= limit:
+                break
+        return results
+    except Exception as e:
+        print(f"  ⚠️ 직업정보 API (212L01) 호출 실패: {e}")
+        return []
+
+
+def _fetch_dict_jobs_from_worknet(
+    job_name: str,
+    *,
+    limit: int = 5,
+    timeout: float = 5.0,
+) -> List[Dict[str, str]]:
+    """
+    워크넷 직업사전 API (212L50) 호출.
+    직업명 키워드로 매칭되는 세세분류 직업 리스트를 반환한다.
+
+    Returns:
+        list[dict]: [{"dJobCd": "K000004005",
+                      "dJobNm": "데이터분석가(일반)"}, ...]
+    """
+    import requests
+
+    api_key = (getattr(config, "WORKNET_API_KEY_JOB", "") or "").strip()
+    if not api_key or not job_name:
+        return []
+
+    try:
+        url = "https://www.work24.go.kr/cm/openApi/call/wk/callOpenApiSvcInfo212L50.do"
+        params = {
+            "authKey": api_key,
+            "returnType": "XML",
+            "target": "dJobCD",
+            "srchType": "K",
+            "keyword": str(job_name).strip(),
+            "startPage": 1,
+            "display": limit,
+        }
+        r = requests.get(url, params=params, timeout=timeout)
+        if r.status_code != 200:
+            return []
+
+        root = ET.fromstring(r.text)
+        results: List[Dict[str, str]] = []
+        for job_node in root.findall(".//dJobList"):
+            results.append({
+                "dJobCd": (job_node.findtext("dJobCd") or "").strip(),
+                "dJobNm": (job_node.findtext("dJobNm") or "").strip(),
+            })
+            if len(results) >= limit:
+                break
+        return results
+    except Exception as e:
+        print(f"  ⚠️ 직업사전 API (212L50) 호출 실패: {e}")
+        return []
+
+
+def fetch_worknet_supplementary(
+    top3_df: Optional[pd.DataFrame],
+    *,
+    max_related: int = 3,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    TOP 3 직업 각각에 대해 워크넷 직업정보(212L01) + 직업사전(212L50) API 호출.
+
+    Returns:
+        dict[직업명] = {
+            "official_name": "워크넷 공식 직업명",
+            "category_name": "직업 분류명",
+            "related_jobs": ["관련 세세분류 직업1", "직업2", ...]
+        }
+    """
+    if top3_df is None or top3_df.empty:
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for _, row in top3_df.head(3).iterrows():
+        job_name = str(row.get("직업명", "")).strip()
+        if not job_name:
+            continue
+
+        info_jobs = _fetch_related_jobs_from_worknet(job_name, limit=1)
+        dict_jobs = _fetch_dict_jobs_from_worknet(job_name, limit=max_related + 1)
+
+        # 직업사전 응답에서 입력 직업명과 동일/포함관계인 항목은 중복 노이즈로 제외
+        related = [
+            j["dJobNm"]
+            for j in dict_jobs
+            if j["dJobNm"]
+            and job_name not in j["dJobNm"]
+            and j["dJobNm"] not in job_name
+        ][:max_related]
+
+        result[job_name] = {
+            "official_name": info_jobs[0]["jobNm"] if info_jobs else "",
+            "category_name": info_jobs[0]["jobClcdNM"] if info_jobs else "",
+            "related_jobs": related,
+        }
+
+        if info_jobs or related:
+            official = info_jobs[0]["jobNm"] if info_jobs else "N/A"
+            print(
+                f"  🔗 워크넷 보강 [{job_name}]: 공식={official}, "
+                f"관련직업 {len(related)}건"
+            )
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # 기능 1) ToT + 자기일관성 기반 직업 인사이트 생성
 # ──────────────────────────────────────────────────────────────────────────────
 def generate_job_insight(
@@ -178,6 +337,28 @@ def generate_job_insight(
     """
     # STEP 1 — TOP-3 요약
     jobs_summary = _fmt_top3_summary(top3_df) if (top3_df is not None and not top3_df.empty) else ""
+
+    # STEP 1-b — 워크넷 OpenAPI 실시간 보강 (212L01 직업정보 + 212L50 직업사전)
+    #   API 키 미설정 / 호출 실패 시 빈 dict 가 반환되므로 jobs_summary 는 그대로 유지된다.
+    worknet_data = fetch_worknet_supplementary(top3_df, max_related=3)
+    if worknet_data:
+        worknet_lines: List[str] = []
+        for job_name, info in worknet_data.items():
+            line = f"### {job_name}"
+            if info.get("category_name"):
+                line += f" (분류: {info['category_name']})"
+            if info.get("related_jobs"):
+                line += "\n관련 세부 직업: " + ", ".join(info["related_jobs"])
+            worknet_lines.append(line)
+
+        if worknet_lines:
+            worknet_context = (
+                "\n\n[워크넷 OpenAPI 실시간 보강 정보 "
+                "(212L01 직업정보 + 212L50 직업사전)]\n"
+                + "\n\n".join(worknet_lines)
+            )
+            jobs_summary = jobs_summary + worknet_context
+            print(f"  🔗 워크넷 API 보강 완료: {len(worknet_data)}건")
 
     # STEP 2 — 시스템 프롬프트 (외부 파일 우선, 없으면 기본값) [기법①]
     system_text = _load_prompt("system_prompt.txt")
