@@ -21,6 +21,7 @@ Claude(Anthropic) 모델로 자연어 인사이트로 변환한다.
 from __future__ import annotations
 
 import json  # noqa: F401  (외부에서 사용할 수 있도록 노출)
+import re
 import sys as _sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -104,7 +105,7 @@ def _fmt_top3_summary(top3_df: pd.DataFrame) -> str:
         임금_text = (
             f"월 {int(float(임금)):,}천원"
             if pd.notna(임금) and float(임금) > 0
-            else "정보 없음 (워크넷에서 확인 권장)"
+            else "정보 없음 (고용24에서 확인 권장)"
         )
 
         try:
@@ -587,11 +588,247 @@ def generate_ncs_translation(ncs_terms: List[str]) -> str:
     terms_text = "\n".join([f"- {t}" for t in ncs_terms])
     user_prompt = f"아래 NCS 용어들을 번역해주세요:\n{terms_text}"
 
+    # NCS 용어 3개 × (NCS→현장 + 실무 예시 + 이종산업 3개) ≈ 1500~2000 토큰 필요
     return _safe_create_message(
-        max_tokens=800,
+        max_tokens=2000,
         user_prompt=user_prompt,
         system_text=translation_system,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 기능 2-2) 직업별 NCS → 시장 언어 번역 쌍 (Before/After + Context, JSON)
+#   STEP 2 "언어 재정의" 화면에서 직업별 4쌍 안팎의 번역 카드를 노출하기 위해 사용.
+#   추출된 사용자 역량을 참고 컨텍스트로 활용해 개인화된 매칭 표현을 우선 제안.
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_language_redefinition(
+    job_name: str,
+    job_category: str,
+    user_skills: Optional[Dict[str, List[str]]] = None,
+    max_pairs: int = 4,
+) -> List[Dict[str, str]]:
+    """NCS 행정 용어와 시장 채용공고 표현 쌍을 직업별로 생성한다.
+
+    Args:
+        job_name: 직업명 (예: "데이터분석가").
+        job_category: 직업 분류명 (예: "정보통신 연구개발직").
+        user_skills: extract_user_skills() 산출 dict (선택). 맥락화에 활용.
+        max_pairs: 생성할 Before/After 쌍 개수 (기본 4).
+
+    Returns:
+        list[dict]: [{"before": NCS 원문, "after": 시장 언어,
+                      "context": 활용 예시}, ...]
+                    실패 시 빈 리스트.
+    """
+    if not str(job_name or "").strip():
+        return []
+
+    # 사용자 역량 컨텍스트 (각 카테고리 상위 3개씩만 압축)
+    skills_context = ""
+    if user_skills:
+        items: List[str] = []
+        for cat, lst in user_skills.items():
+            if lst:
+                items.append(f"{cat}: {', '.join(lst[:3])}")
+        if items:
+            skills_context = (
+                "\n[참고 — 사용자 보유 역량]\n" + "\n".join(items)
+            )
+
+    prompt = f"""다음 직업에 적용되는 핵심 역량을 NCS 행정 용어와 시장 채용공고 표현으로 비교 정리하세요.
+
+[직업 정보]
+- 직업명: {job_name}
+- 직업 분류: {job_category}{skills_context}
+
+[작성 원칙]
+1. NCS 원문(Before)은 한국산업인력공단 NCS 능력단위에서 사용되는 행정 표현
+2. 시장 언어(After)는 채용공고·자기소개서에서 실제 사용되는 일상 표현
+3. 두 표현이 동일한 역량을 가리켜야 함 (단순 번역이 아닌 의미 대응)
+4. 사용자 보유 역량을 참고하여 사용자가 즉시 활용 가능한 표현 우선
+5. {max_pairs}개의 핵심 역량 쌍을 작성
+
+[작성 예시]
+- Before: "조직 내 갈등 관리 및 의사소통 능력"
+  After: "팀 협업 환경에서의 조정 및 커뮤니케이션 경험"
+
+- Before: "정량 데이터 수집·분석 및 통계적 해석"
+  After: "데이터 기반 의사결정을 위한 분석 및 인사이트 도출"
+
+[출력 형식 — JSON 배열만 반환, 다른 설명 없음]
+[
+  {{
+    "before": "NCS 원문 표현",
+    "after": "시장 언어 표현",
+    "context": "어떤 상황에서 활용 가능한지 1~2문장 안내"
+  }},
+  ...
+]"""
+
+    try:
+        raw = _safe_create_message(
+            max_tokens=1200,
+            user_prompt=prompt,
+            system_text=(
+                "당신은 NCS 행정 용어를 시장 채용공고 언어로 번역하는 "
+                "전문가입니다. JSON 배열만 반환하세요."
+            ),
+        )
+
+        if not raw or raw.startswith("Claude 호출 실패"):
+            raise RuntimeError(raw or "empty response")
+
+        text = raw.strip()
+        # 코드 펜스 제거 (```json ... ``` 형태도 안전 처리)
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            return []
+
+        result: List[Dict[str, str]] = []
+        for item in parsed[:max_pairs]:
+            if not isinstance(item, dict):
+                continue
+            before = str(item.get("before", "")).strip()
+            after = str(item.get("after", "")).strip()
+            context = str(item.get("context", "")).strip()
+            if before and after:
+                result.append({
+                    "before": before,
+                    "after": after,
+                    "context": context,
+                })
+
+        print(f"  ✏️ 언어 재정의 [{job_name}]: {len(result)}쌍 생성")
+        return result
+
+    except Exception as e:
+        print(f"  ⚠️ 언어 재정의 실패 [{job_name}]: {e}")
+        return []
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 기능 2-3) 상담사용 직무 용어 미니 사전 (NCS 능력단위 ↔ 시장 표현 + 설명/예시)
+#   워크넷 L11 NCS 능력단위 응답을 컨텍스트로 받아 상담사가 내담자에게
+#   설명할 때 즉시 활용 가능한 용어 카드를 5개 내외 생성한다.
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_terminology_dictionary(
+    job_name: str,
+    job_category: str,
+    ncs_terms: Optional[List[Dict[str, str]]] = None,
+    max_terms: int = 5,
+) -> List[Dict[str, str]]:
+    """상담사 모드용 직무 용어 미니 사전 생성.
+
+    Args:
+        job_name: 직업명.
+        job_category: 직업 분류명.
+        ncs_terms: 워크넷 L11 NCS 능력단위 정보 리스트 (선택).
+                   각 항목: {"name": "능력단위명", "definition": "정의"}.
+        max_terms: 생성할 용어 카드 개수 (기본 5).
+
+    Returns:
+        list[dict]: [{"ncs_term": ..., "market_term": ...,
+                      "explanation": ..., "example": ...}, ...]
+                    실패 시 빈 리스트.
+    """
+    if not str(job_name or "").strip():
+        return []
+
+    # 워크넷 L11 컨텍스트 (NCS 능력단위 상위 10개 + 정의 100자까지)
+    ncs_context = ""
+    if ncs_terms:
+        items: List[str] = []
+        for term in ncs_terms[:10]:
+            if not isinstance(term, dict):
+                continue
+            name = str(term.get("name", "")).strip()
+            definition = str(term.get("definition", "")).strip()
+            if not name:
+                continue
+            if definition:
+                items.append(f"- {name}: {definition[:100]}")
+            else:
+                items.append(f"- {name}")
+        if items:
+            ncs_context = "\n[참고 — 워크넷 NCS 능력단위 원문]\n" + "\n".join(items)
+
+    prompt = f"""당신은 청년 구직자 상담을 돕는 직업 데이터 전문가입니다.
+직업상담사가 다음 직업을 내담자에게 설명할 때 사용할 핵심 직무 용어 사전을 작성하세요.
+
+[직업 정보]
+- 직업명: {job_name}
+- 직업 분류: {job_category}{ncs_context}
+
+[작성 원칙]
+1. NCS 능력단위 원문(공식 행정 용어)을 기반으로 작성
+2. 각 용어에 대해 시장 채용공고에서 사용되는 표현을 함께 제시
+3. 상담사가 내담자에게 어떻게 설명할지 안내 추가
+4. 구체적 활용 예시 1개 포함
+5. {max_terms}개의 핵심 직무 용어를 선정
+
+[작성 예시]
+- ncs_term: "정량 데이터 수집 및 통계적 해석 능력"
+  market_term: "데이터 분석 · 인사이트 도출"
+  explanation: "내담자가 통계 도구 사용 경험이 있다면 '데이터 기반 의사결정 경험'으로 풀어 설명"
+  example: "Excel 피벗테이블로 매출 데이터 분석한 경험 → 시장 언어로 '데이터 분석 능력'"
+
+[출력 형식 — JSON 배열만 반환, 다른 설명 없음]
+[
+  {{
+    "ncs_term": "NCS 원문 표현",
+    "market_term": "시장 채용공고 표현",
+    "explanation": "상담 시 어떻게 설명할지 안내 (1~2문장)",
+    "example": "구체적 활용 예시 1문장"
+  }},
+  ...
+]"""
+
+    try:
+        raw = _safe_create_message(
+            max_tokens=1500,
+            user_prompt=prompt,
+            system_text=(
+                "당신은 NCS 직무 용어를 상담사에게 설명하는 전문가입니다. "
+                "JSON 배열만 반환하세요."
+            ),
+        )
+
+        if not raw or raw.startswith("Claude 호출 실패"):
+            raise RuntimeError(raw or "empty response")
+
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            return []
+
+        result: List[Dict[str, str]] = []
+        for item in parsed[:max_terms]:
+            if not isinstance(item, dict):
+                continue
+            ncs_term = str(item.get("ncs_term", "")).strip()
+            market_term = str(item.get("market_term", "")).strip()
+            explanation = str(item.get("explanation", "")).strip()
+            example = str(item.get("example", "")).strip()
+            if ncs_term and market_term:
+                result.append({
+                    "ncs_term": ncs_term,
+                    "market_term": market_term,
+                    "explanation": explanation,
+                    "example": example,
+                })
+
+        print(f"  📚 직무 용어 사전 [{job_name}]: {len(result)}개 생성")
+        return result
+
+    except Exception as e:
+        print(f"  ⚠️ 직무 용어 사전 실패 [{job_name}]: {e}")
+        return []
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -629,6 +866,147 @@ def generate_counselor_questions(
         if line.strip() and len(line.strip()) > 5
     ]
     return lines[:3] if lines else ["질문 생성 결과가 비어 있습니다."]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 기능 3-2) 상담사용 CoT 통합 분석 (STEP 1·2 1회 호출 [기법⑥ + ⑧])
+#   STEP 1: 역량·시장·임금 3관점 독립 분석
+#   STEP 2: 3관점 교차검증 (자기일관성 — Self-Consistency)
+#   상담사 화면에서 STEP 1·2 expander 본문으로 사용.
+# ──────────────────────────────────────────────────────────────────────────────
+def generate_counselor_cot_analysis(
+    top3_df: pd.DataFrame,
+    user_skills: Optional[Dict[str, List[str]]] = None,
+    user_input: str = "",
+) -> Dict[str, Any]:
+    """상담사 모드용 CoT 통합 분석 (STEP 1·2 단일 호출).
+
+    1회 LLM 호출로 다음을 생성한다:
+        - STEP 1: 역량·시장·임금 3관점 독립 분석 (각 관점별 2~3문장)
+        - STEP 2: 3관점 교차검증 (자기일관성, 3~4문장)
+
+    Args:
+        top3_df: filter_top3() 결과 (직업명·구인배율·임금·학력 등 컬럼 포함).
+        user_skills: extract_user_skills() 산출 dict (선택).
+        user_input: 내담자 원본 입력 (최대 500자 사용).
+
+    Returns:
+        dict: {
+            'step1': {
+                'competency': '역량 관점 분석...',
+                'market':     '시장 관점 분석...',
+                'wage':       '임금 관점 분석...',
+            },
+            'step2': '3관점 교차검증 결과 및 상담 메시지...',
+        }
+        실패 시 {'step1': {}, 'step2': ''} 반환.
+    """
+    if top3_df is None or top3_df.empty:
+        return {"step1": {}, "step2": ""}
+
+    # TOP 3 직업 요약 라인 (구인배율 / 월평균임금 / 주요학력 핵심 지표만)
+    jobs_lines: List[str] = []
+    for i, (_, row) in enumerate(top3_df.head(3).iterrows(), 1):
+        line = f"{i}. {row.get('직업명', '')}"
+        구인 = row.get("평균구인배율")
+        임금 = row.get("월평균임금_천원")
+        학력 = row.get("주요학력수준")
+        if pd.notna(구인):
+            try:
+                line += f" | 구인배율 {float(구인):.2f}"
+            except (TypeError, ValueError):
+                pass
+        if pd.notna(임금):
+            try:
+                line += f" | 월평균 {int(float(임금)):,}천원"
+            except (TypeError, ValueError):
+                pass
+        if pd.notna(학력) and str(학력).strip():
+            line += f" | 주요학력 {학력}"
+        jobs_lines.append(line)
+    jobs_text = "\n".join(jobs_lines)
+
+    # 사용자 역량 컨텍스트 (각 카테고리 상위 3개씩만 압축)
+    skills_lines: List[str] = []
+    if user_skills:
+        for cat, lst in user_skills.items():
+            if lst:
+                skills_lines.append(f"{cat}: {', '.join(lst[:3])}")
+    skills_context = "\n".join(skills_lines) if skills_lines else "(추출된 역량 없음)"
+
+    safe_input = str(user_input or "").strip()[:500] or "(입력 없음)"
+
+    prompt = f"""당신은 청년 구직자를 상담하는 직업상담사입니다.
+다음 내담자에 대해 AI가 추천한 TOP 3 직업을 3관점으로 분석하고 교차검증하세요.
+
+[내담자 입력]
+{safe_input}
+
+[내담자 보유 역량]
+{skills_context}
+
+[AI 추천 TOP 3 직업]
+{jobs_text}
+
+[작성 원칙]
+1. STEP 1: 3관점 독립 분석 (역량 / 시장 / 임금)
+   - 각 관점에서 TOP 3 직업의 적합성을 평가
+   - 데이터 근거 명시 (KNOW 학력 분포, EIS 구인배율, 직종별 임금통계 등)
+   - 2~3문장 분량
+
+2. STEP 2: 3관점 교차검증 (자기일관성)
+   - 3관점의 평가가 일치하는 직업 vs 불일치하는 직업 식별
+   - 어떤 직업이 균형 잡힌 선택인지 또는 어느 관점에서 우세한지 판단
+   - 상담사가 내담자에게 안내할 핵심 메시지 도출
+   - 3~4문장 분량
+
+[출력 형식 — JSON만 반환, 다른 설명 없음]
+{{
+  "step1": {{
+    "competency": "역량 관점 분석 내용...",
+    "market": "시장 관점 분석 내용...",
+    "wage": "임금 관점 분석 내용..."
+  }},
+  "step2": "교차검증 결과 및 상담 메시지..."
+}}"""
+
+    try:
+        raw = _safe_create_message(
+            max_tokens=1500,
+            user_prompt=prompt,
+            system_text=(
+                "당신은 데이터 기반 직업상담을 수행하는 전문 상담사입니다. "
+                "JSON만 반환하세요."
+            ),
+        )
+
+        if not raw or raw.startswith("Claude 호출 실패"):
+            raise RuntimeError(raw or "empty response")
+
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("응답이 JSON object 가 아닙니다.")
+
+        step1_raw = parsed.get("step1", {})
+        if not isinstance(step1_raw, dict):
+            step1_raw = {}
+        step1: Dict[str, str] = {
+            "competency": str(step1_raw.get("competency", "") or "").strip(),
+            "market": str(step1_raw.get("market", "") or "").strip(),
+            "wage": str(step1_raw.get("wage", "") or "").strip(),
+        }
+        step2 = str(parsed.get("step2", "") or "").strip()
+
+        print("  🧠 CoT 통합 분석 완료 (3관점 + 교차검증)")
+        return {"step1": step1, "step2": step2}
+
+    except Exception as e:
+        print(f"  ⚠️ CoT 통합 분석 실패: {e}")
+        return {"step1": {}, "step2": ""}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -710,8 +1088,9 @@ if __name__ == "__main__":
         "통계 분석을 잘합니다. IT 대기업 공채를 준비했으나 "
         "방향을 바꾸고 싶습니다."
     )
-    top3 = search_jobs(query)
-    if not top3.empty:
+    search_out = search_jobs(query)
+    top3 = search_out.get("results")
+    if top3 is not None and not top3.empty:
         result = generate_job_insight(query, top3, mode="jobseeker")
         print("\n[구직자용 인사이트]")
         print(result["insight_text"])
@@ -724,8 +1103,9 @@ if __name__ == "__main__":
         "법학을 전공하고 사법시험을 준비했으나 방향을 바꾸고 싶습니다. "
         "논리적 분석과 문서 작성에 강점이 있습니다."
     )
-    top3_2 = search_jobs(query2)
-    if not top3_2.empty:
+    search_out_2 = search_jobs(query2)
+    top3_2 = search_out_2.get("results")
+    if top3_2 is not None and not top3_2.empty:
         result2 = generate_job_insight(query2, top3_2, mode="counselor")
         print("\n[상담사용 가이드]")
         print(result2["insight_text"])

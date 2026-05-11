@@ -16,9 +16,10 @@ JIB(Job_Insight_Bridge) — 매칭 모듈 (RAG 검색 코어).
 
 from __future__ import annotations
 
+import re
 import sys as _sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -165,6 +166,231 @@ def embed_query(text: str) -> np.ndarray:
     except Exception as e:
         print(f"⚠️ 쿼리 임베딩 실패: {e}")
         return np.zeros(_DEFAULT_EMBED_DIM, dtype=np.float32)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 역량 키워드 추출 (UI 표시·진단용 — 매칭 점수에는 사용하지 않음)
+#   디스패처: 콜론 패턴이 있으면 정규식 (Fast Path),
+#             자유서술이면 Claude LLM 추출 (Smart Path) → 실패 시 정규식 폴백.
+# ──────────────────────────────────────────────────────────────────────────────
+_CERT_INDICATORS = (
+    "급", "기사", "산업기사", "기능사", "면허", "사무관", "사례관리사",
+    "ADsP", "SQLD", "SQLP", "ADP",
+    "컴퓨터활용능력", "워드프로세서", "정보처리", "정보보안",
+    "GTQ", "TOEIC", "TOEFL", "TEPS", "OPIc", "HSK", "JLPT",
+    "AICPA", "CPA", "CFA", "PMP", "자격", "인증",
+)
+
+# 의미 없는 단일어·연결어 — 정규식 추출 후 토큰 단계에서 제외.
+_INVALID_TOKENS = frozenset({
+    "졸업", "재학", "수료", "있음", "없음", "준비", "관심",
+    "있어", "없어", "입니다", "합니다", "하고", "있고", "없고",
+    "됨", "있는", "없는", "많음", "좋음",
+})
+
+# 콜론 패턴 감지: '전공/학력:', '기술:', '역량:', '자격:', '강점:', '경험:',
+# '희망:', '관심:', '고민:', '상담목적:' 등 (Fast Path 라우팅용).
+_COLON_PATTERN_RE = re.compile(
+    r"(?:전공|학력|기술|역량|자격|강점|장점|성향|경험|"
+    r"희망|관심|선호|고민|상담)[/\s]*[:\uff1a]"
+)
+
+
+def _empty_skills() -> Dict[str, List[str]]:
+    """5개 카테고리가 빈 리스트로 초기화된 dict 를 반환한다."""
+    return {
+        "학력": [],
+        "자격증": [],
+        "기술도구": [],
+        "강점성향": [],
+        "희망방향": [],
+    }
+
+
+def _clean_tokens(text_segment: str) -> List[str]:
+    """세그먼트에서 의미 있는 토큰만 추출 (오탐 필터 + 최소 길이 검사)."""
+    out: List[str] = []
+    for token in re.split(r"[,/、·∙]|\s{2,}", text_segment):
+        token = token.strip(" .;\u00b7")
+        if not token or token in _INVALID_TOKENS:
+            continue
+        if len(token) < 2:
+            continue
+        out.append(token)
+    return out
+
+
+def extract_user_skills(user_input: str) -> Dict[str, List[str]]:
+    """사용자 입력에서 카테고리별 역량 키워드를 추출한다.
+
+    - 콜론(:) 패턴이 있으면 정규식 기반 추출 (Fast Path)
+    - 콜론이 없으면 Claude API 로 LLM 추출 (Smart Path)
+    - LLM 실패 시 정규식으로 폴백.
+
+    UI 표시 및 진단용으로 사용되며, 검색 점수 계산에는 영향을 주지 않는다.
+
+    Returns:
+        dict: {'학력': [...], '자격증': [...], '기술도구': [...],
+               '강점성향': [...], '희망방향': [...]}
+    """
+    if not user_input or not str(user_input).strip():
+        return _empty_skills()
+
+    has_colon_pattern = bool(_COLON_PATTERN_RE.search(user_input))
+    if has_colon_pattern:
+        return _extract_skills_by_regex(user_input)
+    return _extract_skills_by_llm(user_input)
+
+
+def _extract_skills_by_regex(user_input: str) -> Dict[str, List[str]]:
+    """콜론 패턴이 명확한 입력에 사용하는 정규식 기반 추출.
+
+    오탐 키워드(`_INVALID_TOKENS`) 와 최소 길이 2자 필터를 적용한다.
+    """
+    skills = _empty_skills()
+    text = str(user_input).strip()
+
+    # 학력: '전공/학력: ~', '학력: ~', '전공: ~' (콜론은 ASCII : 또는 전각 ：)
+    for pat in (
+        r"전공[/\s]*학력[:\uff1a\s]+([^\n.]+)",
+        r"학력[:\uff1a\s]+([^\n.]+)",
+        r"전공[:\uff1a\s]+([^\n.]+)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            skills["학력"].extend(_clean_tokens(m.group(1)))
+            break
+
+    # 학력 키워드 직접 매칭 (의미 있는 학위 표시만 보완)
+    edu_keywords = (
+        "고졸", "전문대졸", "대졸", "대학원졸", "박사졸",
+        "학사", "석사", "박사", "4년제", "2년제",
+    )
+    edu_joined = " ".join(skills["학력"])
+    for kw in edu_keywords:
+        if kw in text and kw not in edu_joined:
+            skills["학력"].append(kw)
+
+    # 자격증/기술 도구: 단일 섹션에서 자격 인디케이터 유무로 분기.
+    # '보유 기술', '보유 역량', '자격증', '자격', '기술', '역량' 라벨 모두 지원.
+    for pat in (
+        r"(?:보유\s*기술|보유\s*역량|자격증|자격)[:\uff1a\s]+([^\n.]+)",
+        r"기술[:\uff1a\s]+([^\n.]+)",
+        r"역량[:\uff1a\s]+([^\n.]+)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            for token in _clean_tokens(m.group(1)):
+                if any(ind in token for ind in _CERT_INDICATORS):
+                    skills["자격증"].append(token)
+                else:
+                    skills["기술도구"].append(token)
+            break
+
+    # 강점·성향 — '경험' / '주요 경험' 도 의미상 강점·성향에 흡수.
+    for pat in (
+        r"강점[:\uff1a\s]+([^\n.]+)",
+        r"장점[:\uff1a\s]+([^\n.]+)",
+        r"성향[:\uff1a\s]+([^\n.]+)",
+        r"(?:주요\s*)?경험[:\uff1a\s]+([^\n.]+)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            skills["강점성향"].extend(_clean_tokens(m.group(1)))
+            break
+
+    # 희망 방향 — 상담사 모드의 '고민', '상담목적', '고민/상담목적' 라벨도 흡수.
+    # 슬래시 결합 라벨('고민/상담목적')이 단독 라벨보다 우선 매칭되도록 먼저 배치.
+    for pat in (
+        r"고민[/\s]*상담\s*목적[:\uff1a\s]+([^\n.]+)",
+        r"희망\s*(?:방향|진로|직무)?[:\uff1a\s]+([^\n.]+)",
+        r"(?:관심|선호)[:\uff1a\s]+([^\n.]+)",
+        r"(?:고민|상담\s*목적|상담목적)[:\uff1a\s]+([^\n.]+)",
+    ):
+        m = re.search(pat, text)
+        if m:
+            skills["희망방향"].extend(_clean_tokens(m.group(1)))
+            break
+
+    for key in skills:
+        skills[key] = list(dict.fromkeys(skills[key]))
+    return skills
+
+
+def _extract_skills_by_llm(user_input: str) -> Dict[str, List[str]]:
+    """자유서술 입력을 Claude API 로 카테고리별 분류한다.
+
+    Claude 호출이 실패하면 정규식 추출로 자동 폴백한다.
+    """
+    import json
+
+    skills = _empty_skills()
+
+    try:
+        # 함수 내부 import — 모듈 로딩 시 순환 import 방지
+        from utils.claude_generator import _safe_create_message
+
+        prompt = f"""다음 자유서술 입력에서 청년 구직자의 역량 키워드를 5개 카테고리로 분류하세요.
+
+[입력]
+{user_input}
+
+[추출 규칙]
+- 학력: 전공명, 학위(고졸·대졸 등), 학교 유형(4년제 등)
+- 자격증: 공식 자격증명, 면허, 시험명 (ADsP, 컴활1급, TOEIC 등)
+- 기술도구: 프로그래밍 언어, 소프트웨어, 도구명 (Python, Excel, Photoshop 등)
+- 강점성향: 본인이 강점·성향으로 언급한 것 (외향성, 꼼꼼함, 분석력, 글쓰기 등)
+- 희망방향: 희망 직무·산업·근무 형태 (사무직, IT, 안정적, 창의적 등)
+
+[추출 원칙]
+- 명확하게 언급된 키워드만 추출 (추측 금지)
+- 의미 없는 단어("졸업", "있음", "준비") 제외
+- 각 키워드는 명사 형태로 정리
+- 카테고리별 0~5개 키워드
+
+[출력 형식 — JSON만 반환, 다른 설명 없음]
+{{
+  "학력": ["..."],
+  "자격증": ["..."],
+  "기술도구": ["..."],
+  "강점성향": ["..."],
+  "희망방향": ["..."]
+}}"""
+
+        raw = _safe_create_message(
+            max_tokens=500,
+            user_prompt=prompt,
+            system_text=(
+                "당신은 청년 구직자 역량 분류 전문가입니다. JSON만 반환하세요."
+            ),
+        )
+
+        if not raw or raw.startswith("Claude 호출 실패"):
+            raise RuntimeError(raw or "empty response")
+
+        text = raw.strip()
+        # 코드 펜스 제거 (```json ... ``` 형태도 안전 처리)
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("응답이 JSON object 가 아닙니다.")
+
+        for key in skills:
+            value = parsed.get(key)
+            if isinstance(value, list):
+                items = [str(x).strip() for x in value if str(x).strip()]
+                # 카테고리별 최대 5개, 입력 순서 유지하며 중복 제거
+                skills[key] = list(dict.fromkeys(items))[:5]
+
+        total = sum(len(v) for v in skills.values())
+        print(f"  🧠 LLM 역량 추출: 총 {total}개")
+        return skills
+
+    except Exception as e:
+        print(f"  ⚠️ LLM 역량 추출 실패, 정규식으로 폴백: {e}")
+        return _extract_skills_by_regex(user_input)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -549,14 +775,24 @@ def search_jobs(
     query_text: str,
     user_wage_floor: Optional[float] = None,
     use_query_expansion: bool = True,
-) -> pd.DataFrame:
-    """
-    find_similar_jobs() + filter_top3() 를 묶은 원스톱 검색 함수.
-    Streamlit 페이지에서 직접 호출하는 메인 인터페이스.
+) -> Dict[str, Any]:
+    """find_similar_jobs() + filter_top3() 를 묶은 원스톱 검색 함수.
 
+    Streamlit 페이지에서 직접 호출하는 메인 인터페이스.
     use_query_expansion=True (기본값) 시 expand_query_with_claude() 로
     쿼리를 한 번 확장한 뒤 임베딩 매칭에 사용한다 (기법④ STEP 1).
+
+    Returns:
+        dict: {
+            'results' (pd.DataFrame): 최종 TOP-N 추천 결과 (실패/없음 시 빈 DF).
+            'extracted_skills' (dict[str, list[str]]): 사용자 입력에서 추출한
+                카테고리별 역량 키워드 (학력 / 자격증 / 기술도구 / 강점성향 / 희망방향).
+            'expanded_query' (str): 확장된 검색 쿼리 (확장 미사용 시 원본).
+        }
     """
+    # UI/진단용 카테고리별 역량 추출 (점수에는 사용하지 않음).
+    extracted_skills = extract_user_skills(query_text)
+
     # 학력 키워드는 Claude 확장 단계에서 의역·삭제될 수 있으므로
     # 항상 원본 query_text 기준으로 추출한다.
     user_edu_score = extract_education_score(query_text)
@@ -569,24 +805,33 @@ def search_jobs(
     else:
         search_text = query_text
 
-    preview = (search_text or "").strip().replace("\n", " ")
+    expanded_query = search_text or ""
+    preview = expanded_query.strip().replace("\n", " ")
     print(
         f"🔍 검색: '{preview[:60]}...' "
         f"(상위 {config.TOP_K_CANDIDATES}개 후보 탐색)"
     )
 
-    candidates = find_similar_jobs(search_text)
+    candidates = find_similar_jobs(expanded_query)
     if candidates.empty:
         print("⚠️ 유사도 임계값 이상의 후보가 없습니다.")
-        return pd.DataFrame()
+        return {
+            "results": pd.DataFrame(),
+            "extracted_skills": extracted_skills,
+            "expanded_query": expanded_query,
+        }
 
-    result = filter_top3(
+    result_df = filter_top3(
         candidates,
         user_wage_floor=user_wage_floor,
         user_edu_score=user_edu_score,
     )
-    print(f"✅ TOP {len(result)} 직업 선정 완료")
-    return result
+    print(f"✅ TOP {len(result_df)} 직업 선정 완료")
+    return {
+        "results": result_df,
+        "extracted_skills": extracted_skills,
+        "expanded_query": expanded_query,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────

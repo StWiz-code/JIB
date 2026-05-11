@@ -1,4 +1,5 @@
 import html
+import re
 import streamlit as st
 import pandas as pd
 from utils.matcher import search_jobs
@@ -7,7 +8,234 @@ from utils.claude_generator import (
     generate_stepback_analysis,
     generate_ncs_translation,
     fetch_worknet_supplementary,
+    generate_language_redefinition,
 )
+
+
+# ─────────────────────────────────────────────
+# UI 헬퍼 — 안전한 마크다운 렌더링 + 인사이트 파싱
+# ─────────────────────────────────────────────
+
+
+def _safe_render_markdown(text: str) -> str:
+    """Streamlit 마크다운 특수 문자에 의한 오작동 방지.
+
+    - 라인 시작 ``---`` / ``~~~`` (수평선) → 빈 줄
+    - 중간 ``~~`` (취소선) → en dash
+    - 숫자 사이 ``~`` (예: ``4~6개월``) → en dash
+    - 인라인 ``•`` → 줄바꿈 + 마크다운 bullet ``-``
+    - 카드 안에서 폭주하는 헤딩(``#``/``##``/``###``) → ``**굵게**``
+    """
+    if not text:
+        return ""
+
+    # 1. 라인 시작의 연속 하이픈/물결 (수평선 회피)
+    text = re.sub(r"^---+\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\~\~\~+\s*$", "", text, flags=re.MULTILINE)
+
+    # 2. 중간 ~~ (취소선) → en dash, 숫자 사이 단일 ~도 안전 처리
+    text = text.replace("~~", "‒")
+    text = re.sub(r"(\d)\~(\d)", r"\1‒\2", text)
+
+    # 3. 인라인 "•" → 줄바꿈 + 마크다운 bullet으로 분리
+    #    예: "역량 관점 • A: ... • B: ... • C: ..."
+    #       → "역량 관점\n- A: ...\n- B: ...\n- C: ..."
+    if "•" in text:
+        new_lines = []
+        for line in text.split("\n"):
+            if "•" in line:
+                parts = line.split("•")
+                first = parts[0].strip()
+                if first:
+                    new_lines.append(first)
+                for part in parts[1:]:
+                    part = part.strip()
+                    if part:
+                        new_lines.append(f"- {part}")
+            else:
+                new_lines.append(line)
+        text = "\n".join(new_lines)
+
+    # 4. 마크다운 헤딩 다운그레이드 (카드 안 폭주 방지)
+    text = re.sub(r"^###\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+    text = re.sub(r"^##\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+    text = re.sub(r"^#\s+(.+)$", r"**\1**", text, flags=re.MULTILINE)
+
+    return text
+
+
+def _inline_md_to_html(text: str) -> str:
+    """인라인 마크다운(``**bold**``, ``` `code` ```)을 HTML로 변환."""
+    if not text:
+        return ""
+    text = re.sub(r"\*\*([^\*]+?)\*\*", r"<strong>\1</strong>", text)
+    text = re.sub(
+        r"`([^`]+?)`",
+        r"<code style=\"background:#eef2f6; padding:1px 5px; "
+        r"border-radius:3px; font-size:0.9em;\">\1</code>",
+        text,
+    )
+    # 인라인 안전 — `_safe_render_markdown` 통과 후에도 남아 있는 헤딩 방어
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"<strong>\1</strong>", text)
+    return text
+
+
+def _convert_markdown_to_card_html(text: str) -> str:
+    """마크다운 텍스트를 카드 내부에 안전하게 표시할 HTML로 변환.
+
+    처리:
+    - ``**bold**`` → ``<strong>``
+    - ```code``` → ``<code>``
+    - ``- bullet`` / ``* bullet`` → ``<ul><li>``
+    - ``1. 항목`` (숫자 리스트) → ``<ol><li>``
+    - 빈 줄 → 단락 분리(작은 spacer)
+    - 마크다운 헤딩(``#``) → 굵은 텍스트
+    - 일반 라인 → ``<div>`` 래핑
+
+    LLM 출력은 신뢰하는 컨텍스트이므로 별도 HTML escape는 적용하지 않는다.
+    """
+    if not text:
+        return ""
+
+    # 0. 공통 안전 처리 (수평선 / 취소선 / 인라인 • / 헤딩 강등)
+    text = _safe_render_markdown(text)
+
+    lines = text.split("\n")
+    html_lines: list = []
+    in_ul = False
+    in_ol = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if not stripped:
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            if in_ol:
+                html_lines.append("</ol>")
+                in_ol = False
+            html_lines.append("<div style=\"height:0.6em;\"></div>")
+            continue
+
+        bullet_match = re.match(r"^[\-\*]\s+(.+)$", stripped)
+        if bullet_match:
+            content = _inline_md_to_html(bullet_match.group(1))
+            if in_ol:
+                html_lines.append("</ol>")
+                in_ol = False
+            if not in_ul:
+                html_lines.append(
+                    "<ul style=\"margin:0.3em 0 0.6em 1.2em; "
+                    "padding-left:0.5em; line-height:1.75;\">"
+                )
+                in_ul = True
+            html_lines.append(
+                f"<li style=\"margin-bottom:0.3em;\">{content}</li>"
+            )
+            continue
+
+        ol_match = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+        if ol_match:
+            content = _inline_md_to_html(ol_match.group(2))
+            if in_ul:
+                html_lines.append("</ul>")
+                in_ul = False
+            if not in_ol:
+                html_lines.append(
+                    "<ol style=\"margin:0.5em 0 0.6em 1.2em; "
+                    "padding-left:0.5em; line-height:1.75;\">"
+                )
+                in_ol = True
+            html_lines.append(
+                "<li style=\"margin-bottom:0.4em; font-weight:600;\">"
+                f"{content}</li>"
+            )
+            continue
+
+        # 일반 텍스트 라인 — 열린 리스트가 있으면 먼저 닫음
+        if in_ul:
+            html_lines.append("</ul>")
+            in_ul = False
+        if in_ol:
+            html_lines.append("</ol>")
+            in_ol = False
+
+        content = _inline_md_to_html(stripped)
+        html_lines.append(
+            f"<div style=\"margin:0.3em 0; line-height:1.75;\">{content}</div>"
+        )
+
+    if in_ul:
+        html_lines.append("</ul>")
+    if in_ol:
+        html_lines.append("</ol>")
+
+    return "\n".join(html_lines)
+
+
+def _fixed_height_item(content_html: str, min_height: str = "3em") -> str:
+    """카드 내 정보 항목을 고정 높이 div로 감싸 줄 맞춤을 보장한다.
+
+    `st.columns(3)` 으로 TOP 3 카드를 가로 배치할 때, 카드별로 정보 분량이
+    달라도 같은 항목 라인이 가로로 정렬되도록 ``min-height`` 를 강제한다.
+    """
+    return (
+        f"<div style='min-height:{min_height}; display:flex; "
+        f"flex-direction:column; justify-content:flex-start; "
+        f"padding:0.3em 0; margin-bottom:0.3em;'>"
+        f"{content_html}"
+        f"</div>"
+    )
+
+
+def _parse_insight_sections(text: str) -> dict:
+    """AI 인사이트 텍스트를 STEP 1·2·3 섹션으로 파싱.
+
+    프롬프트 출력 예시::
+
+        ═════════════════════════════════════
+        ## STEP 1. 3관점 분석
+        ═════════════════════════════════════
+        ...
+
+        ═════════════════════════════════════
+        ## STEP 2. 교차검증
+        ═════════════════════════════════════
+        ...
+    """
+    if not text:
+        return {
+            "step1": "",
+            "step2": "",
+            "step3": "",
+            "raw": "",
+            "has_steps": False,
+        }
+
+    result = {
+        "step1": "",
+        "step2": "",
+        "step3": "",
+        "raw": text,
+        "has_steps": False,
+    }
+
+    step_pattern = re.compile(
+        r"##\s*STEP\s*([1-3])[\.\s]*([^\n]*)\n(.*?)(?=##\s*STEP\s*[1-3]|$)",
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    for step_num, _step_title, step_content in step_pattern.findall(text):
+        cleaned = re.sub(
+            r"^[═━─\=]+\s*$", "", step_content, flags=re.MULTILINE
+        )
+        cleaned = _safe_render_markdown(cleaned.strip())
+        result[f"step{step_num}"] = cleaned
+        result["has_steps"] = True
+
+    return result
+
 
 PROSPECT_LABEL = {
     5: ("📈 증가", "#1B7A4A"),
@@ -160,11 +388,14 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
                 "적합한 직업을 탐색하는 중입니다... (15~30초 소요)"
             ):
                 wage_input = float(wage_floor) if wage_floor > 0 else None
-                top3 = search_jobs(
+                search_result = search_jobs(
                     query_text,
                     user_wage_floor=wage_input,
                     use_query_expansion=True,
                 )
+                top3 = search_result.get("results", pd.DataFrame())
+                extracted_skills = search_result.get("extracted_skills", {})
+                expanded_query = search_result.get("expanded_query", "")
 
             if top3.empty:
                 st.warning("입력하신 내용과 적합한 직업을 찾지 못했습니다. 더 구체적으로 작성해주세요.")
@@ -188,6 +419,8 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
             st.session_state.js_top3 = top3
             st.session_state.js_result = result
             st.session_state.js_show_ncs = show_ncs
+            st.session_state.js_extracted_skills = extracted_skills
+            st.session_state.js_expanded_query = expanded_query
         else:
             st.session_state.js_show_ncs = show_ncs
 
@@ -195,6 +428,7 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
     top3 = st.session_state.get("js_top3", pd.DataFrame())
     result = st.session_state.get("js_result", {})
     show_ncs_flag = st.session_state.get("js_show_ncs", False)
+    extracted_skills = st.session_state.get("js_extracted_skills", {})
 
     if not top3.empty and result:
         # 세션 캐시에서 워크넷 보강 데이터 조회 (없으면 빈 dict 폴백 → expander 미노출)
@@ -202,6 +436,195 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
             f"worknet_data_{hash(tuple(top3['직업명'].tolist()))}"
         )
         worknet_data = st.session_state.get(worknet_cache_key, {})
+
+        # JIB 3단계 자기이해 사이클 안내 (결과 화면 최상단 — 청록 톤)
+        st.markdown(
+            "<div style='background:linear-gradient(90deg, #5A8A7E10 0%, "
+            "#4A6B8A10 100%); border-radius:10px; padding:18px 22px; "
+            "margin-bottom:1.5em; border-left:5px solid #5A8A7E;'>"
+            "<div style='color:#5A8A7E; font-size:0.85em; font-weight:600; "
+            "letter-spacing:0.5px; margin-bottom:8px;'>"
+            "🏠 JIB의 3단계 자기이해 사이클</div>"
+            "<div style='display:flex; gap:12px; flex-wrap:wrap; "
+            "align-items:stretch;'>"
+            # STEP 1
+            "<div style='flex:1; min-width:180px; background:white; "
+            "border-radius:8px; padding:12px 14px; "
+            "box-shadow:0 1px 3px rgba(0,0,0,0.06);'>"
+            "<div style='color:#5A8A7E; font-weight:700; font-size:0.78em; "
+            "margin-bottom:4px;'>STEP 1</div>"
+            "<div style='color:#2c3e50; font-weight:600; font-size:0.95em; "
+            "margin-bottom:4px;'>강점 인식</div>"
+            "<div style='color:#666; font-size:0.82em; line-height:1.4;'>"
+            "AI가 분석한 당신의 역량 카드를 통해 자기 객관화</div>"
+            "</div>"
+            # 화살표
+            "<div style='display:flex; align-items:center; color:#5A8A7E; "
+            "font-size:1.3em;'>→</div>"
+            # STEP 2
+            "<div style='flex:1; min-width:180px; background:white; "
+            "border-radius:8px; padding:12px 14px; "
+            "box-shadow:0 1px 3px rgba(0,0,0,0.06);'>"
+            "<div style='color:#5A8A7E; font-weight:700; font-size:0.78em; "
+            "margin-bottom:4px;'>STEP 2</div>"
+            "<div style='color:#2c3e50; font-weight:600; font-size:0.95em; "
+            "margin-bottom:4px;'>언어 재정의</div>"
+            "<div style='color:#666; font-size:0.82em; line-height:1.4;'>"
+            "NCS 행정 용어를 시장 채용공고 언어로 변환</div>"
+            "</div>"
+            # 화살표
+            "<div style='display:flex; align-items:center; color:#5A8A7E; "
+            "font-size:1.3em;'>→</div>"
+            # STEP 3
+            "<div style='flex:1; min-width:180px; background:white; "
+            "border-radius:8px; padding:12px 14px; "
+            "box-shadow:0 1px 3px rgba(0,0,0,0.06);'>"
+            "<div style='color:#5A8A7E; font-weight:700; font-size:0.78em; "
+            "margin-bottom:4px;'>STEP 3</div>"
+            "<div style='color:#2c3e50; font-weight:600; font-size:0.95em; "
+            "margin-bottom:4px;'>근거 있는 탐색</div>"
+            "<div style='color:#666; font-size:0.82em; line-height:1.4;'>"
+            "공공데이터 17종 기반 역량 적용 가능성 분석</div>"
+            "</div>"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # ─────────────────────────────────────────────
+        # STEP 1. 강점 인식 — 역량 카드 섹션
+        # ─────────────────────────────────────────────
+        st.markdown("---")
+        st.markdown(
+            "<div style='margin-top:1em; margin-bottom:0.3em;'>"
+            "<span style='background-color:#5A8A7E; color:white; padding:4px 12px; "
+            "border-radius:12px; font-size:0.85em; font-weight:600;'>STEP 1</span> "
+            "<span style='font-size:1.3em; font-weight:700; color:#2c3e50; "
+            "margin-left:8px;'>강점 인식 — AI가 분석한 당신의 역량</span>"
+            "</div>"
+            "<p style='color:#666; font-size:0.9em; margin-bottom:1em;'>"
+            "입력하신 내용에서 추출한 핵심 역량을 정리했습니다. "
+            "직업 추천은 이 역량들을 기반으로 진행됩니다.</p>",
+            unsafe_allow_html=True,
+        )
+
+        SKILL_CATEGORIES = [
+            ("학력", "🎓", "#5A8A7E", "전공·학력"),
+            ("자격증", "📜", "#C9A87A", "보유 자격"),
+            ("기술도구", "⚙️", "#4A6B8A", "기술·도구"),
+            ("강점성향", "✨", "#8A7BA8", "강점·성향"),
+            ("희망방향", "🎯", "#C97A6E", "희망 방향"),
+        ]
+
+        skill_cols = st.columns(len(SKILL_CATEGORIES))
+        for col, (key, icon, color, label) in zip(skill_cols, SKILL_CATEGORIES):
+            items = extracted_skills.get(key, []) if extracted_skills else []
+            with col:
+                st.markdown(
+                    f"<div style='background:linear-gradient(135deg, "
+                    f"{color}1A 0%, {color}0D 100%); "
+                    f"border-left:4px solid {color}; border-radius:8px; "
+                    f"padding:14px 16px; min-height:120px; "
+                    f"box-shadow:0 2px 6px rgba(0,0,0,0.04);'>"
+                    f"<div style='font-size:0.85em; color:{color}; "
+                    f"font-weight:600; margin-bottom:8px;'>{icon} {label}</div>",
+                    unsafe_allow_html=True,
+                )
+                if items:
+                    for item in items[:5]:
+                        st.markdown(
+                            f"<div style='display:inline-block; background:white; "
+                            f"color:#2c3e50; padding:4px 10px; margin:3px 4px 3px 0; "
+                            f"border-radius:14px; font-size:0.82em; "
+                            f"border:1px solid {color}40;'>{item}</div>",
+                            unsafe_allow_html=True,
+                        )
+                    if len(items) > 5:
+                        st.markdown(
+                            f"<div style='color:#999; font-size:0.75em; "
+                            f"margin-top:6px;'>외 {len(items) - 5}개</div>",
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.markdown(
+                        "<div style='color:#bbb; font-size:0.82em; "
+                        "font-style:italic;'>정보 없음</div>",
+                        unsafe_allow_html=True,
+                    )
+                st.markdown("</div>", unsafe_allow_html=True)
+
+        total_skills = sum(
+            len(items) for items in extracted_skills.values()
+        ) if extracted_skills else 0
+        if total_skills > 0:
+            st.markdown(
+                f"<div style='background:#f5f9f7; border-radius:8px; "
+                f"padding:12px 16px; margin-top:1em; color:#5A8A7E; "
+                f"font-size:0.88em;'>"
+                f"💡 총 <b>{total_skills}개</b>의 역량 키워드가 추출되었습니다. "
+                f"이 역량들은 521개 직업과의 의미적 유사도 계산에 활용됩니다."
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div style='background:#fff8e1; border-left:4px solid #d68910; "
+                "border-radius:8px; padding:14px 18px; margin-top:1em;'>"
+                "<b style='color:#9a6500;'>📝 더 정확한 분석을 위한 안내</b><br/>"
+                "<span style='color:#666; font-size:0.9em;'>"
+                "입력 내용에서 역량 키워드를 명확히 추출하지 못했습니다. "
+                "다음 형식으로 입력해보세요:</span><br/>"
+                "<code style='background:white; padding:6px 10px; margin-top:8px; "
+                "display:inline-block; border-radius:6px; font-size:0.85em; "
+                "color:#2c3e50;'>"
+                "전공: 영어영문학 / 자격증: ADsP / 강점: 외향성, 글쓰기 / 희망: 사무직"
+                "</code></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        # ─────────────────────────────────────────────
+        # STEP 2 안내 — 언어 재정의 종합 안내
+        # ─────────────────────────────────────────────
+        st.markdown(
+            "<div style='margin-top:1em; margin-bottom:0.3em;'>"
+            "<span style='background-color:#5A8A7E; color:white; padding:4px 12px; "
+            "border-radius:12px; font-size:0.85em; font-weight:600;'>STEP 2</span> "
+            "<span style='font-size:1.3em; font-weight:700; color:#2c3e50; "
+            "margin-left:8px;'>"
+            "언어 재정의 — NCS 행정 용어를 시장 언어로</span>"
+            "</div>"
+            "<p style='color:#666; font-size:0.9em; margin-bottom:1em;'>"
+            "추천된 각 직업의 NCS 행정 용어를 채용공고·자기소개서에서 활용 가능한 "
+            "시장 언어로 변환합니다. 직업 카드 내부의 "
+            "<b>✏️ STEP 2. 언어 재정의</b> 섹션을 펼쳐 확인하세요.</p>"
+            "<div style='background:#f5f9f7; border-radius:8px; padding:10px 14px; "
+            "color:#5A8A7E; font-size:0.85em; margin-bottom:1.5em;'>"
+            "💬 추천된 각 직업마다 Before(NCS 원문) / After(시장 언어) 쌍이 "
+            "제공됩니다. 채용공고 검색, 자기소개서 작성, 면접 답변 준비 시 "
+            "활용하세요."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("---")
+
+        # ─────────────────────────────────────────────
+        # STEP 3. 근거 있는 탐색 — TOP 3 직업 카드 진입 헤더
+        # ─────────────────────────────────────────────
+        st.markdown(
+            "<div style='margin-top:1em; margin-bottom:0.3em;'>"
+            "<span style='background-color:#5A8A7E; color:white; padding:4px 12px; "
+            "border-radius:12px; font-size:0.85em; font-weight:600;'>STEP 3</span> "
+            "<span style='font-size:1.3em; font-weight:700; color:#2c3e50; "
+            "margin-left:8px;'>근거 있는 탐색 — 역량 적용 가능성 분석</span>"
+            "</div>"
+            "<p style='color:#666; font-size:0.9em; margin-bottom:1.5em;'>"
+            "당신의 역량이 어떤 직업에서 어떻게 활용될 수 있는지, "
+            "공공데이터 17종을 기반으로 분석한 결과입니다. "
+            "각 직업의 추천 근거를 함께 확인하세요.</p>",
+            unsafe_allow_html=True,
+        )
 
         # TOP 3 카드
         st.markdown("""
@@ -251,14 +674,15 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
             대분류_clean = clean_str(대분류)
             중분류_clean = clean_str(중분류)
 
+            # HTML 컨텍스트 안전성 — '>' 는 엔티티로 출력
             if 대분류_clean and 중분류_clean:
-                분류_text = f"{대분류_clean} > {중분류_clean}"
+                분류_text = f"{대분류_clean} &gt; {중분류_clean}"
             elif 대분류_clean:
                 분류_text = 대분류_clean
             elif 중분류_clean:
                 분류_text = 중분류_clean
             else:
-                분류_text = "직업 분야 정보 없음"
+                분류_text = "분류 정보 없음"
 
             try:
                 구인_f = float(구인배율) if pd.notna(구인배율) else 0.0
@@ -319,12 +743,25 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
                 rank_emoji = ["🥇", "🥈", "🥉"][idx]
                 st.markdown(f"""
 <div class="job-card-js">
-<div style="font-size:clamp(1rem, 4vw, 1.4rem);">{rank_emoji}</div>
-<div style="font-size:clamp(0.95rem, 3vw, 1.15rem); font-weight:700; color:#1A1A1A; margin:0.3rem 0;">
-{직업명}
-</div>
-<div style="font-size:clamp(0.8rem, 2.5vw, 0.85rem); color:#555; margin-bottom:0.7rem;">
-{분류_text}
+<div style="min-height:5.5em; display:flex; flex-direction:column;
+            justify-content:flex-start; padding:0.4em 0 0.6em 0;
+            border-bottom:1px solid #e8ecef; margin-bottom:0.8em;">
+    <div style="font-size:clamp(0.95rem, 3vw, 1.15rem); font-weight:700;
+                color:#1A1A1A; line-height:1.3; margin-bottom:0.3em;
+                display:-webkit-box; -webkit-line-clamp:2;
+                -webkit-box-orient:vertical; overflow:hidden;
+                min-height:1.5em;"
+         title="{직업명}">
+        <span style="font-size:0.95em; margin-right:0.25em;">{rank_emoji}</span>{직업명}
+    </div>
+    <div style="font-size:clamp(0.72rem, 2.2vw, 0.8rem); color:#666;
+                line-height:1.4;
+                display:-webkit-box; -webkit-line-clamp:2;
+                -webkit-box-orient:vertical; overflow:hidden;
+                min-height:2.2em;"
+         title="{분류_text}">
+        {분류_text}
+    </div>
 </div>
 <div style="font-size:clamp(0.82rem, 2.5vw, 0.88rem); margin-bottom:0.3rem;">
 🎯 <b>역량 적합도</b> {유사도_f:.1%}
@@ -341,23 +778,150 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
 </div>
 """, unsafe_allow_html=True)
 
-                st.markdown(wage_html, unsafe_allow_html=True)
+                # 💰 임금 — 고정 높이(4em) 컨테이너로 카드 간 줄 맞춤
+                wage_html_wrapped = (
+                    f"<div style='font-size:0.92em; line-height:1.5;'>{wage_html}</div>"
+                )
+                st.markdown(
+                    _fixed_height_item(wage_html_wrapped, "4em"),
+                    unsafe_allow_html=True,
+                )
 
-                # 분위 임금 분포 (wage_by_job.csv 매칭된 직업만)
+                # 📊 분위 임금 분포 — 데이터 유무와 관계없이 동일 높이(3em)
                 상위25 = row.get('상위25_임금_천원')
                 중위 = row.get('중위_임금_천원')
                 하위25 = row.get('하위25_임금_천원')
                 if pd.notna(상위25) and pd.notna(중위) and pd.notna(하위25):
-                    범위_html = (
-                        f"📊 임금 분포: "
+                    range_html_inner = (
+                        f"<div style='font-size:0.9em; line-height:1.5;'>"
+                        f"📊 임금 분포 "
                         f"<span style='color:#888;'>하위 {int(하위25):,}</span> · "
                         f"<b>중위 {int(중위):,}</b> · "
-                        f"<span style='color:#5a8a7e;'>상위 {int(상위25):,}</span> 천원"
+                        f"<span style='color:#5a8a7e;'>상위 {int(상위25):,}</span>"
+                        f"<span style='color:#888; font-size:0.85em;'> 천원</span>"
+                        f"</div>"
                     )
-                    st.markdown(범위_html, unsafe_allow_html=True)
+                else:
+                    range_html_inner = (
+                        "<div style='font-size:0.85em; color:#bbb;'>"
+                        "📊 임금 분포: <i>해당 직업 데이터 없음</i></div>"
+                    )
+                st.markdown(
+                    _fixed_height_item(range_html_inner, "3em"),
+                    unsafe_allow_html=True,
+                )
 
-                # 학력 분포 inline 표시 (주요학력수준 + 비중 + 적합도 라벨)
-                if pd.notna(주요학력):
+                # 추천 근거 카드 (CoT 요약 — 유사도·수요·학력 적합도 종합)
+                최종점수 = row.get('최종점수', 0.0)
+                try:
+                    최종점수_f = float(최종점수)
+                except (TypeError, ValueError):
+                    최종점수_f = 0.0
+                try:
+                    유사도_f = float(유사도) if pd.notna(유사도) else 0.0
+                except (TypeError, ValueError):
+                    유사도_f = 0.0
+                try:
+                    학력적합도_f = float(학력적합도) if pd.notna(학력적합도) else 0.0
+                except (TypeError, ValueError):
+                    학력적합도_f = 0.0
+
+                if 최종점수_f >= 0.6:
+                    추천_강도, 추천_색상 = "강력 추천", "#5A8A7E"
+                elif 최종점수_f >= 0.45:
+                    추천_강도, 추천_색상 = "적극 검토", "#7BA098"
+                else:
+                    추천_강도, 추천_색상 = "참고 검토", "#9CB3AC"
+
+                근거_요인 = []
+                if 유사도_f >= 0.50:
+                    근거_요인.append(
+                        f"역량 유사도 <b>{유사도_f * 100:.0f}%</b> (높음)"
+                    )
+                elif 유사도_f >= 0.40:
+                    근거_요인.append(
+                        f"역량 유사도 <b>{유사도_f * 100:.0f}%</b> (보통)"
+                    )
+                else:
+                    근거_요인.append(
+                        f"역량 유사도 <b>{유사도_f * 100:.0f}%</b>"
+                    )
+
+                # 구인 수요 4단계 분기 — 0.00 미집계는 공채·헤드헌팅 위주로 안내
+                if pd.notna(구인배율):
+                    try:
+                        구인배율_f = float(구인배율)
+                    except (TypeError, ValueError):
+                        구인배율_f = 0.0
+                    try:
+                        부족률_f = float(부족률) if pd.notna(부족률) else 0.0
+                    except (TypeError, ValueError):
+                        부족률_f = 0.0
+
+                    if 구인배율_f >= 1.0:
+                        근거_요인.append(
+                            f"구인 수요 <b>활발</b> (배율 {구인배율_f:.2f}, 구인&gt;구직)"
+                        )
+                    elif 구인배율_f >= 0.5:
+                        근거_요인.append(
+                            f"구인 수요 <b>양호</b> (배율 {구인배율_f:.2f})"
+                        )
+                    elif 구인배율_f > 0:
+                        근거_요인.append(
+                            f"구인 수요 <b>제한적</b> (배율 {구인배율_f:.2f})"
+                        )
+                    else:
+                        # 0.00은 월별 채용 통계 미집계 직종 — 부족률로 수요 신호 보강
+                        if 부족률_f > 2.0:
+                            근거_요인.append(
+                                f"구인 수요 <b>통계 미집계</b> "
+                                f"(부족률 {부족률_f:.1f}%, 수요↑)"
+                            )
+                        elif 부족률_f > 0:
+                            근거_요인.append(
+                                f"구인 수요 <b>통계 미집계</b> "
+                                f"(부족률 {부족률_f:.1f}%)"
+                            )
+                        else:
+                            근거_요인.append(
+                                "구인 수요 <b>통계 미집계</b> 직종"
+                            )
+
+                if 학력적합도_f >= 0.05:
+                    근거_요인.append("학력 적합도 <b>✓ 적합</b>")
+                elif 학력적합도_f >= 0.02:
+                    근거_요인.append("학력 적합도 <b>△ 약간 차이</b>")
+                elif 학력적합도_f < 0:
+                    근거_요인.append("학력 적합도 <b>⚠ 진입 어려움</b>")
+
+                근거_html = "<br>".join([f"• {요인}" for 요인 in 근거_요인])
+
+                st.markdown(
+                    f"<div style='background:linear-gradient(135deg, "
+                    f"{추천_색상}15 0%, {추천_색상}08 100%); "
+                    f"border-left:4px solid {추천_색상}; border-radius:8px; "
+                    f"padding:14px 18px; margin:1em 0; min-height:14.5em;'>"
+                    f"<div style='display:flex; justify-content:space-between; "
+                    f"align-items:center; margin-bottom:10px;'>"
+                    f"<span style='color:{추천_색상}; font-weight:700; "
+                    f"font-size:0.95em;'>🎯 추천 근거</span>"
+                    f"<span style='background:{추천_색상}; color:white; "
+                    f"padding:3px 10px; border-radius:10px; font-size:0.78em; "
+                    f"font-weight:600;'>{추천_강도}</span>"
+                    f"</div>"
+                    f"<div style='color:#2c3e50; font-size:0.86em; "
+                    f"line-height:1.65;'>{근거_html}</div>"
+                    f"<div style='color:#888; font-size:0.78em; margin-top:10px; "
+                    f"padding-top:10px; border-top:1px solid {추천_색상}20;'>"
+                    f"📊 활용: KNOW 직업전망 · 학력 분포 · "
+                    f"고용24·EIS 구인구직 · 임금통계"
+                    f"</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # 🎓 학력 적합도 inline — 데이터 유무와 관계없이 동일 높이(3em)
+                if pd.notna(주요학력) and 주요학력:
                     if 학력적합도 >= 0.05:
                         fit_label = "<span style='color:#5a8a7e;'>✓ 학력 적합</span>"
                     elif 학력적합도 >= 0.02:
@@ -376,11 +940,25 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
                     else:
                         ratio_str = ""
 
-                    edu_html = (
-                        f"🎓 주요 학력: <b>{주요학력}</b> {ratio_str} {fit_label}".strip()
+                    edu_html_inner = (
+                        f"<div style='font-size:0.92em; line-height:1.5;'>"
+                        f"🎓 주요 학력: <b>{주요학력}</b> "
+                        f"<span style='color:#666;'>{ratio_str}</span> "
+                        f"{fit_label}"
+                        f"</div>"
                     )
-                    st.markdown(edu_html, unsafe_allow_html=True)
+                else:
+                    edu_html_inner = (
+                        "<div style='font-size:0.88em; color:#bbb;'>"
+                        "🎓 주요 학력: <i>데이터 없음</i></div>"
+                    )
+                st.markdown(
+                    _fixed_height_item(edu_html_inner, "3em"),
+                    unsafe_allow_html=True,
+                )
 
+                # 🎓 학력 분포 상세 expander — 데이터 유무와 관계없이 슬롯 유지
+                if pd.notna(주요학력) and 주요학력:
                     with st.expander("🎓 학력 분포 상세"):
                         if pd.notna(고졸이하비율):
                             st.markdown(
@@ -399,25 +977,165 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
                             "직업별 교육훈련 및 학력 분포"
                         )
                         st.caption("※ 본 직업 종사자의 실제 학력 분포 (응답자 기준)")
+                else:
+                    # 데이터 없을 때도 동일한 expander 구조 사용 (라벨만 다름)
+                    with st.expander("🎓 학력 분포 상세 (데이터 없음)", expanded=False):
+                        st.markdown(
+                            "<div style='color:#666; font-size:0.88em; "
+                            "padding:0.6em 0;'>"
+                            "<i>해당 직업의 학력 분포 데이터를 찾을 수 없습니다.</i><br>"
+                            "<span style='color:#888; font-size:0.85em; "
+                            "margin-top:0.4em; display:inline-block;'>"
+                            "KNOW 직업정보의 학력 분포 응답 표본이 부족하거나 "
+                            "마스터 데이터셋에 학력 컬럼이 누락된 경우입니다."
+                            "</span>"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
 
-                # 워크넷 OpenAPI(212L01/212L50)로 가져온 관련 직업 정보 표시
+                # 언어 재정의 expander — NCS 행정 용어 → 시장 채용공고 표현
+                lang_cache_key = f"js_lang_redef_{직업명}"
+                with st.expander("✏️ STEP 2. 언어 재정의 — NCS 용어를 시장 언어로"):
+                    if lang_cache_key not in st.session_state:
+                        with st.spinner("언어 변환 중..."):
+                            st.session_state[lang_cache_key] = (
+                                generate_language_redefinition(
+                                    job_name=str(직업명),
+                                    job_category=str(
+                                        row.get("중분류명", "")
+                                        or row.get("대분류명", "")
+                                    ),
+                                    user_skills=extracted_skills or {},
+                                    max_pairs=4,
+                                )
+                            )
+                    pairs = st.session_state[lang_cache_key]
+
+                    if not pairs:
+                        st.caption("언어 변환 데이터를 생성하지 못했습니다.")
+                    else:
+                        st.markdown(
+                            "<div style='color:#666; font-size:0.85em; "
+                            "margin-bottom:1em;'>"
+                            "공공 데이터의 NCS 행정 용어를 채용공고·자기소개서에서 "
+                            "활용 가능한 시장 언어로 변환했습니다. "
+                            "자기 표현 시 참고하세요.</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                        for pair in pairs:
+                            before_html = html.escape(pair.get("before", ""))
+                            after_html = html.escape(pair.get("after", ""))
+                            st.markdown(
+                                f"<div style='display:flex; align-items:stretch; "
+                                f"gap:0; margin-bottom:0.8em; border-radius:10px; "
+                                f"overflow:hidden; border:1px solid #e0e6eb;'>"
+                                f"<div style='flex:1; background:#E8ECEF; "
+                                f"padding:12px 16px;'>"
+                                f"<div style='font-size:0.72em; color:#666; "
+                                f"font-weight:600; letter-spacing:0.5px; "
+                                f"margin-bottom:6px;'>BEFORE — NCS 원문</div>"
+                                f"<div style='font-size:0.92em; color:#2c3e50; "
+                                f"line-height:1.5;'>{before_html}</div></div>"
+                                f"<div style='display:flex; align-items:center; "
+                                f"padding:0 8px; background:white; color:#5A8A7E; "
+                                f"font-size:1.3em; font-weight:bold;'>→</div>"
+                                f"<div style='flex:1; background:#E8F4F0; "
+                                f"padding:12px 16px;'>"
+                                f"<div style='font-size:0.72em; color:#5A8A7E; "
+                                f"font-weight:600; letter-spacing:0.5px; "
+                                f"margin-bottom:6px;'>AFTER — 시장 언어</div>"
+                                f"<div style='font-size:0.92em; color:#2c3e50; "
+                                f"line-height:1.5;'>{after_html}</div></div>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                            context_text = (pair.get("context") or "").strip()
+                            if context_text:
+                                st.markdown(
+                                    f"<div style='color:#888; font-size:0.8em; "
+                                    f"margin:-0.5em 0 1em 0; padding-left:1em;'>"
+                                    f"💬 {html.escape(context_text)}</div>",
+                                    unsafe_allow_html=True,
+                                )
+
+                        st.markdown(
+                            "<div style='background:#f5f9f7; border-radius:6px; "
+                            "padding:10px 14px; margin-top:0.5em; color:#5A8A7E; "
+                            "font-size:0.82em;'>"
+                            "💡 위 표현들은 채용공고 검색, 자기소개서 작성, "
+                            "면접 답변 준비 시 활용할 수 있습니다."
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                # 🔗 고용24 관련 직업 정보 — 데이터 유무와 관계없이 expander 슬롯 유지
                 worknet_info = worknet_data.get(직업명, {})
                 if worknet_info.get("related_jobs") or worknet_info.get("official_name"):
-                    with st.expander("🔗 관련 직업 정보 (워크넷 실시간)"):
+                    with st.expander("🔗 관련 직업 정보 (고용24 실시간)"):
+                        st.markdown(
+                            "<div style='color:#666; font-size:0.85em; "
+                            "margin-bottom:0.6em;'>"
+                            "고용24 직업사전에서 실시간으로 가져온 관련 "
+                            "직업 정보입니다."
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
                         official = worknet_info.get("official_name", "")
                         if official and official != 직업명:
-                            st.markdown(f"**워크넷 공식 직업명**: {official}")
+                            st.markdown(
+                                f"<div style='padding:4px 0; color:#2c3e50;'>"
+                                f"<b>고용24 공식 직업명</b>: {official}"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
                         category = worknet_info.get("category_name", "")
                         if category:
-                            st.markdown(f"**직업 분류**: {category}")
+                            st.markdown(
+                                f"<div style='padding:4px 0; color:#2c3e50;'>"
+                                f"<b>직업 분류</b>: {category}"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
                         related = worknet_info.get("related_jobs") or []
                         if related:
                             st.markdown(
-                                f"**관련 세부 직업**: {', '.join(related)}"
+                                "<div style='padding:6px 0 2px 0; "
+                                "color:#2c3e50; font-weight:600;'>"
+                                "관련 세부 직업</div>",
+                                unsafe_allow_html=True,
                             )
+                            for related_name in related:
+                                st.markdown(
+                                    "<div style='padding:4px 0 4px 0.6em; "
+                                    f"color:#2c3e50;'>• {related_name}</div>",
+                                    unsafe_allow_html=True,
+                                )
                         st.caption(
-                            "출처: 한국고용정보원 워크넷 직업정보 API (212L01) "
-                            "+ 직업사전 API (212L50)"
+                            "출처: 한국고용정보원 고용24 직업정보 (212L01) "
+                            "+ 직업사전 (212L50)"
+                        )
+                else:
+                    # 데이터 없을 때도 동일한 expander 구조 사용 (라벨만 다름)
+                    with st.expander("🔗 관련 직업 정보 (고용24 없음)", expanded=False):
+                        st.markdown(
+                            "<div style='color:#666; font-size:0.88em; "
+                            "padding:0.6em 0;'>"
+                            "<i>해당 직업에 대한 고용24 관련 직업 데이터를 "
+                            "찾을 수 없습니다.</i><br>"
+                            "<span style='color:#888; font-size:0.85em; "
+                            "margin-top:0.4em; display:inline-block;'>"
+                            "이는 다음 중 하나의 이유일 수 있습니다:"
+                            "</span>"
+                            "<ul style='color:#888; font-size:0.85em; "
+                            "margin:0.3em 0 0 1.2em; padding:0; line-height:1.6;'>"
+                            "<li>고용24 직업사전에 해당 직업이 등록되지 않음</li>"
+                            "<li>해당 직업명이 고용24 분류 체계와 일치하지 않음</li>"
+                            "<li>실시간 API 호출 일시적 장애</li>"
+                            "</ul>"
+                            "</div>",
+                            unsafe_allow_html=True,
                         )
 
                 if st.button(
@@ -501,7 +1219,9 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
                 "- **평균 임금 (중분류 평균)**: 한국고용정보원 KNOW 임금통계 기준, "
                 "해당 직업이 속한 직종 중분류의 평균값입니다. "
                 "실제 개별 기업·경력·지역에 따라 크게 달라질 수 있으며, "
-                "정확한 임금 정보는 [워크넷](https://www.work24.go.kr) 에서 확인하세요.\n"
+                "정확한 임금 정보는 "
+                "[고용24](https://www.work24.go.kr/cm/main.do) "
+                "또는 채용공고를 통해 확인하세요.\n"
                 "- **구인배율**: EIS 고용행정통계 기준 최근 6개월 평균 "
                 "(구인인원 ÷ 구직건수). 1.0 이상이면 인력 수요 우위입니다. "
                 "값이 `0.00 (미집계)`로 표시된 경우는 해당 직종의 채용이 "
@@ -534,13 +1254,14 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
 </div>
 """, unsafe_allow_html=True)
 
-        # AI 인사이트
-        st.markdown(
-            '<div class="section-header-js">🤖 AI 역량 인사이트</div>',
-            unsafe_allow_html=True,
-        )
+        # ─────────────────────────────────────────────
+        # 🤖 AI 역량 인사이트 — 단계별 카드 렌더링
+        # ─────────────────────────────────────────────
+        st.markdown("---")
+
         # 모바일에서 마크다운 가독성 보강 (헤딩/문단/리스트 폰트 축소)
-        st.markdown("""
+        st.markdown(
+            """
 <style>
 @media (max-width: 640px) {
     .stMarkdown p {
@@ -556,12 +1277,133 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
     }
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+            unsafe_allow_html=True,
+        )
+
+        # 카드 헤더
+        st.markdown(
+            "<div style='display:flex; align-items:center; gap:12px; "
+            "margin-bottom:1.2em;'>"
+            "<div style='font-size:1.6em;'>🤖</div>"
+            "<div>"
+            "<div style='font-size:1.25em; font-weight:700; color:#2c3e50;'>"
+            "AI 역량 인사이트</div>"
+            "<div style='font-size:0.85em; color:#666; margin-top:2px;'>"
+            "Claude Opus 4.7이 11가지 프롬프트 기법으로 생성한 단계별 분석"
+            "</div></div></div>",
+            unsafe_allow_html=True,
+        )
+
         insight_text = result.get("insight_text", "")
-        if insight_text:
-            st.markdown(insight_text)
-        else:
+        if not insight_text:
             st.warning("인사이트 생성에 실패했습니다.")
+        else:
+            sections = _parse_insight_sections(insight_text)
+
+            if sections["has_steps"]:
+                # STEP 1 카드 — 청록 (3관점 분석)
+                if sections["step1"]:
+                    step1_html = _convert_markdown_to_card_html(
+                        sections["step1"]
+                    )
+                    st.markdown(
+                        f"""
+<div style="background:#f5f9f7; border-left:5px solid #5A8A7E;
+            border-radius:12px; padding:18px 22px; margin-bottom:1.2em;
+            box-shadow:0 1px 4px rgba(90,138,126,0.08);">
+    <div style="display:flex; align-items:center; gap:8px;
+                margin-bottom:12px; padding-bottom:10px;
+                border-bottom:1px solid #5A8A7E20;">
+        <span style="background:#5A8A7E; color:white; padding:4px 12px;
+                     border-radius:12px; font-size:0.78em; font-weight:600;">
+            STEP 1
+        </span>
+        <span style="font-weight:700; color:#5A8A7E; font-size:1em;">
+            3관점 분석 — 역량 · 시장 · 임금
+        </span>
+    </div>
+    <div style="color:#2c3e50; font-size:0.95em; line-height:1.75;">
+        {step1_html}
+    </div>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
+
+                # STEP 2 카드 — 황금색 (교차검증)
+                if sections["step2"]:
+                    step2_html = _convert_markdown_to_card_html(
+                        sections["step2"]
+                    )
+                    st.markdown(
+                        f"""
+<div style="background:#fef9e7; border-left:5px solid #d68910;
+            border-radius:12px; padding:18px 22px; margin-bottom:1.2em;
+            box-shadow:0 1px 4px rgba(214,137,16,0.08);">
+    <div style="display:flex; align-items:center; gap:8px;
+                margin-bottom:12px; padding-bottom:10px;
+                border-bottom:1px solid #d6891020;">
+        <span style="background:#d68910; color:white; padding:4px 12px;
+                     border-radius:12px; font-size:0.78em; font-weight:600;">
+            STEP 2
+        </span>
+        <span style="font-weight:700; color:#9a6500; font-size:1em;">
+            교차검증 결과 — 3관점 종합 평가
+        </span>
+    </div>
+    <div style="color:#2c3e50; font-size:0.95em; line-height:1.75;">
+        {step2_html}
+    </div>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
+
+                # STEP 3 카드 — 남색 (최종 인사이트)
+                if sections["step3"]:
+                    step3_html = _convert_markdown_to_card_html(
+                        sections["step3"]
+                    )
+                    st.markdown(
+                        f"""
+<div style="background:linear-gradient(135deg, #E8ECF4 0%, #f0f4fa 100%);
+            border-left:5px solid #2C4F8A;
+            border-radius:12px; padding:18px 22px; margin-bottom:1.2em;
+            box-shadow:0 1px 4px rgba(44,79,138,0.08);">
+    <div style="display:flex; align-items:center; gap:8px;
+                margin-bottom:12px; padding-bottom:10px;
+                border-bottom:1px solid #2C4F8A20;">
+        <span style="background:#2C4F8A; color:white; padding:4px 12px;
+                     border-radius:12px; font-size:0.78em; font-weight:600;">
+            STEP 3
+        </span>
+        <span style="font-weight:700; color:#2C4F8A; font-size:1em;">
+            최종 인사이트 — 종합 분석 및 다음 단계
+        </span>
+    </div>
+    <div style="color:#2c3e50; font-size:0.95em; line-height:1.75;">
+        {step3_html}
+    </div>
+</div>
+""",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                # 파싱 실패 fallback — 전체 텍스트 단일 HTML 카드
+                fallback_html = _convert_markdown_to_card_html(
+                    sections["raw"]
+                )
+                st.markdown(
+                    f"""
+<div style="background:#f7f9fb; border-left:5px solid #5A8A7E;
+            border-radius:12px; padding:18px 22px; color:#2c3e50;
+            font-size:0.95em; line-height:1.75;">
+    {fallback_html}
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
 
         feedback = st.session_state.get("feedback", [])
         neg_jobs = [f["job"] for f in feedback if f.get("type") == "negative"]
@@ -615,15 +1457,42 @@ IT 대기업 공채를 준비했으나 방향을 바꾸고 싶습니다.
 </div>
 """, unsafe_allow_html=True)
 
-        # NCS 번역 (선택적)
+        # ─────────────────────────────────────────────
+        # 🔄 NCS → 현장 언어 번역 — 단일 HTML 블록 통합 렌더링
+        # ─────────────────────────────────────────────
         if show_ncs_flag and st.session_state.get("js_last_query"):
-            st.markdown('<div class="section-header-js">🔄 NCS → 현장 언어 번역</div>',
-                       unsafe_allow_html=True)
+            st.markdown("---")
+
             ncs_terms = ["데이터 분석", "통계 처리", "정보시스템 운용"]
             with st.spinner("번역 중..."):
                 translation = generate_ncs_translation(ncs_terms)
-            trans_html = (translation or '').replace('\n', '<br>')
+
+            translation_html = _convert_markdown_to_card_html(translation or "")
+
+            # 헤더 + 본문 카드를 단일 HTML 블록으로 통합 (시각적 단절 제거)
             st.markdown(
-                f'<div class="insight-box">{trans_html}</div>',
-                unsafe_allow_html=True
+                f"""
+<div style="margin-bottom:1.2em;">
+    <div style="display:flex; align-items:center; gap:12px;
+                margin-bottom:1em;">
+        <div style="font-size:1.5em;">🔄</div>
+        <div>
+            <div style="font-size:1.15em; font-weight:700; color:#2c3e50;">
+                NCS → 현장 언어 번역
+            </div>
+            <div style="font-size:0.82em; color:#666; margin-top:2px;">
+                공공데이터의 행정 용어를 채용공고·자기소개서에서 활용 가능한
+                시장 언어로 변환
+            </div>
+        </div>
+    </div>
+    <div style="background:#f7f9fb; border-left:5px solid #6B7280;
+                border-radius:12px; padding:18px 22px; color:#2c3e50;
+                font-size:0.93em; line-height:1.7;
+                box-shadow:0 1px 3px rgba(107,114,128,0.06);">
+        {translation_html}
+    </div>
+</div>
+""",
+                unsafe_allow_html=True,
             )

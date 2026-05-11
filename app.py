@@ -260,7 +260,7 @@ with st.sidebar:
         st.markdown("---")
 
     st.markdown("**데이터 출처**")
-    st.caption("• 한국고용정보원 워크넷")
+    st.caption("• 한국고용정보원 고용24")
     st.caption("• 한국산업인력공단 NCS")
     st.caption("• 고용노동부 고용행정통계")
     st.caption("• 고용노동통계포털 임금통계")
@@ -315,7 +315,7 @@ with st.sidebar:
             if l11_ok and claude_ok and openai_ok:
                 st.success("핵심 API 모두 정상 연동 중입니다.")
             elif claude_ok and openai_ok:
-                st.info("AI 핵심 기능은 정상입니다. 워크넷 일부 API는 파일 기반으로 동작합니다.")
+                st.info("AI 핵심 기능은 정상입니다. 고용24 일부 API는 파일 기반으로 동작합니다.")
             else:
                 st.warning("일부 API 연동에 문제가 있습니다. 관리자에게 문의하세요.")
 
